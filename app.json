@@ -27,22 +27,21 @@
     },
     "plugins": [
       "expo-router",
+      "expo-web-browser",
+      "expo-sqlite",
       [
-        "expo-splash-screen",
+        "expo-auth-session",
         {
-          "image": "./assets/images/splash-icon.png",
-          "imageWidth": 200,
-          "resizeMode": "contain",
-          "backgroundColor": "#ffffff",
-          "dark": {
-            "backgroundColor": "#000000"
-          }
+          "iosUrlScheme": "aichatapp"
         }
       ]
-    ],
-    "experiments": {
-      "typedRoutes": true,
-      "reactCompiler": true
-    }
+    ]
+      "expo-web-browser",
+    "expo-sqlite"
+  ],
+  "experiments": {
+    "typedRoutes": true,
+    "reactCompiler": true
   }
+}
 }
