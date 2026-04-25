@@ -25,23 +25,10 @@
       "output": "static",
       "favicon": "./assets/images/favicon.png"
     },
-    "plugins": [
-      "expo-router",
-      "expo-web-browser",
-      "expo-sqlite",
-      [
-        "expo-auth-session",
-        {
-          "iosUrlScheme": "aichatapp"
-        }
-      ]
-    ]
-      "expo-web-browser",
-    "expo-sqlite"
-  ],
-  "experiments": {
-    "typedRoutes": true,
-    "reactCompiler": true
+    "plugins": ["expo-router", "expo-web-browser", "expo-sqlite"],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    }
   }
-}
 }
