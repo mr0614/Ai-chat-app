@@ -116,9 +116,9 @@ class ChatEngine {
           let res: Response;
           try {
             res = await fetch(
-              "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + key,
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" + key,
               { method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: maxTokens } }) }
+                body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } } }) }
             );
           } catch (netErr: any) {
             console.error("[Gemini] network error:", netErr?.message);
@@ -448,9 +448,9 @@ async function pseudoStream(
       if (attempt > 0) await new Promise((r) => setTimeout(r, 1500 * attempt));
       await geminiRateLimit();
       const res = await fetch(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + key,
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" + key,
         { method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: maxTokens } }) }
+          body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } } }) }
       );
       if (res.status === 429) {
         lastErr = "Geminiのレート制限に達しました。しばらく待って再試行しています...";
@@ -582,9 +582,9 @@ async function callWithModel(
       if (attempt > 0) await new Promise((r) => setTimeout(r, 2000 * attempt));
       await geminiRateLimit(); // 4.5秒インターバルを強制
       const res = await fetch(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + key,
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" + key,
         { method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: maxTokens } }) }
+          body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } } }) }
       );
       if (res.status === 429) continue;
       if (!res.ok) break;
@@ -731,9 +731,9 @@ async function callAI(
       parts: [{ text: m.content }],
     }));
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${key}`,
       { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents, generationConfig: { maxOutputTokens: maxTokens } }) }
+        body: JSON.stringify({ contents, generationConfig: { maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } } }) }
     );
     const d = await res.json();
     return d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
@@ -1072,14 +1072,16 @@ function UsageDisplay({ stats, model }: {
   }, []);
 
   if (model === "gemini") {
-    const used    = stats.gemini.minuteRequests;
-    const resetIn = Math.max(0, Math.ceil((60000 - (now - stats.gemini.minuteStart)) / 1000));
+    const used = stats.gemini.minuteRequests;
     const FREE_LIMIT = 15;
-    // cost情報がないので常に無料枠表示（Geminiは従量課金でもreq単位なので同じ表示でOK）
+    // スライディングウィンドウ: 最古のリクエストから60秒後にリセット
+    const timestamps = (stats.gemini as any).timestamps ?? [];
+    const oldest = timestamps.length > 0 ? timestamps[0] : now;
+    const resetIn = Math.max(0, Math.ceil((oldest + 60000 - now) / 1000));
     return (
       <View style={usageStyles.wrap}>
         <Text style={usageStyles.row}>{used + "/" + FREE_LIMIT}</Text>
-        <Text style={usageStyles.sub}>{"残" + resetIn + "s"}</Text>
+        <Text style={usageStyles.sub}>{used > 0 ? "残" + resetIn + "s" : "利用可"}</Text>
       </View>
     );
   }
@@ -1327,19 +1329,19 @@ export default function AIScreen() {
       apiKeysRef.current = { claude: kCl ?? "", gemini: kGe ?? "", openai: kOp ?? "" };
       if (persona) setUserAiPersona(persona);
     });
-    // chatEngineの変化を購読（タブにいなくてもリアルタイム更新）
+    // chatEngineの変化を購読
+    // ※ onMessageコールバックでリアルタイム更新するのでここはloading/error/pausedのみ
     const unsub = chatEngine.subscribe(async () => {
       const s = await chatEngine.getState();
       setChatWaitingMsg(s.waitingMsg ?? "");
       setChatLoading(s.loading);
-      if (!s.loading && s.messages.length > 0) setChatPaused(true);
-      if (s.messages.length > 0) {
-        // streaming中はそのまま、完了後はcleanにする
-        setChatMessages(s.messages.map((m: any) =>
-          s.loading ? m : { ...m, streaming: false }
-        ));
-        if (s.started) setChatStarted(true);
-        if (s.turnCount) setChatTurnCount(s.turnCount);
+      if (!s.loading) {
+        setChatPaused(true);
+        if (s.turnCount > 0) setChatTurnCount(s.turnCount);
+        if (s.messages.length > 0) {
+          // 完了時にcleanなメッセージで確定
+          setChatMessages(s.messages.map((m: any) => ({ ...m, streaming: false })));
+        }
       }
       if (s.error && s.error.length > 0) {
         setChatMessages((prev: any[]) => {
@@ -1668,12 +1670,27 @@ export default function AIScreen() {
 
     const updateMsg = (msg: any) => {
       setChatMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (msg.streaming && last?.streaming && last.role === msg.role) return [...prev.slice(0, -1), msg];
-        if (msg.streaming && msg.text === "") return [...prev, msg];
-        if (!msg.streaming && last?.streaming && last.role === msg.role) return [...prev.slice(0, -1), { ...msg }];
-        if (!msg.streaming) return [...prev, msg];
-        return prev;
+        // streaming更新: 同じroleのstreaming中のメッセージを置き換え
+        if (msg.streaming) {
+          const lastStreamingIdx = [...prev].reverse().findIndex((m) => m.streaming && m.role === msg.role);
+          if (lastStreamingIdx >= 0) {
+            const idx = prev.length - 1 - lastStreamingIdx;
+            const next = [...prev];
+            next[idx] = msg;
+            return next;
+          }
+          // streaming開始（空テキスト）
+          return [...prev, msg];
+        }
+        // streaming完了: 最後のstreaming要素を確定版に置き換え
+        const lastStreamingIdx = [...prev].reverse().findIndex((m) => m.streaming && m.role === msg.role);
+        if (lastStreamingIdx >= 0) {
+          const idx = prev.length - 1 - lastStreamingIdx;
+          const next = [...prev];
+          next[idx] = { ...msg, streaming: false };
+          return next;
+        }
+        return [...prev, { ...msg, streaming: false }];
       });
     };
     chatEngine.runTurns(curModel, curKeys, personaPr, TURNS_PER_BLOCK, updateMsg)
@@ -1709,12 +1726,24 @@ export default function AIScreen() {
 
     const updateMsg2 = (msg: any) => {
       setChatMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (msg.streaming && last?.streaming && last.role === msg.role) return [...prev.slice(0, -1), msg];
-        if (msg.streaming && msg.text === "") return [...prev, msg];
-        if (!msg.streaming && last?.streaming && last.role === msg.role) return [...prev.slice(0, -1), { ...msg }];
-        if (!msg.streaming) return [...prev, msg];
-        return prev;
+        if (msg.streaming) {
+          const lastStreamingIdx = [...prev].reverse().findIndex((m) => m.streaming && m.role === msg.role);
+          if (lastStreamingIdx >= 0) {
+            const idx = prev.length - 1 - lastStreamingIdx;
+            const next = [...prev];
+            next[idx] = msg;
+            return next;
+          }
+          return [...prev, msg];
+        }
+        const lastStreamingIdx = [...prev].reverse().findIndex((m) => m.streaming && m.role === msg.role);
+        if (lastStreamingIdx >= 0) {
+          const idx = prev.length - 1 - lastStreamingIdx;
+          const next = [...prev];
+          next[idx] = { ...msg, streaming: false };
+          return next;
+        }
+        return [...prev, { ...msg, streaming: false }];
       });
     };
     chatEngine.runTurns(curModel, curKeys, personaPr, TURNS_PER_BLOCK, updateMsg2)
@@ -1759,7 +1788,7 @@ export default function AIScreen() {
           if (!key) throw new Error("GeminiのAPIキーが未設定です");
           for (let attempt = 0; attempt < 3; attempt++) {
             if (attempt > 0) await new Promise((r2) => setTimeout(r2, 5000));
-            const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + key,
+            const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" + key,
               { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 80 } }) });
             if (r.status === 429) {
               if (attempt === 2) throw new Error("Gemini 429: レート制限。しばらく待ってから試してください");
@@ -1920,7 +1949,7 @@ export default function AIScreen() {
                 <View key={i} style={[styles.chatBubbleWrap, isYou ? styles.chatBubbleWrapYou : styles.chatBubbleWrapOther]}>
                   <Text style={styles.chatBubbleRole}>{isYou ? "あなたAI" : AI_PERSONAS.find((p) => p.id === chatPersona)?.label}</Text>
                   <View style={[styles.chatBubble, isYou ? styles.chatBubbleYou : styles.chatBubbleOther]}>
-                    <Text style={styles.chatBubbleText}>{msg.text}{msg.streaming ? "▌" : ""}</Text>
+                    <Text style={styles.chatBubbleText}>{msg.text}</Text>
                   </View>
                 </View>
               );
@@ -2108,17 +2137,17 @@ const styles = StyleSheet.create({
   chatTopInputRow:   { flexDirection: "row", alignItems: "flex-end", gap: 8, paddingHorizontal: 12, paddingTop: 10, paddingBottom: 6 },
   chatInputAreaTop:  { paddingHorizontal: 12, paddingVertical: 8, borderBottomWidth: 0.5, borderBottomColor: "#1e1e1e" },
   chatBottomActions: { flexDirection: "row", gap: 8, padding: 10, justifyContent: "flex-end", borderBottomWidth: 0.5, borderBottomColor: "#1e1e1e" },
-  chatLog:          { padding: 16, gap: 16 },
+  chatLog:          { padding: 16, gap: 20, paddingBottom: 24 },
   chatEmpty:        { paddingTop: 60, alignItems: "center" },
   chatEmptyText:    { color: "#333", fontSize: 14, textAlign: "center", lineHeight: 24 },
   chatBubbleWrap:     { gap: 4 },
   chatBubbleWrapYou:  { alignItems: "flex-end" },
   chatBubbleWrapOther:{ alignItems: "flex-start" },
-  chatBubbleRole:   { color: "#444", fontSize: 10, paddingHorizontal: 4 },
-  chatBubble:       { maxWidth: "85%", borderRadius: 16, padding: 12, flexShrink: 1 },
-  chatBubbleYou:    { backgroundColor: "#1a1a2e", borderWidth: 1, borderColor: "#2a2a5a" },
-  chatBubbleOther:  { backgroundColor: "#1a1a1a", borderWidth: 1, borderColor: "#2a2a2a" },
-  chatBubbleText:   { color: "#e0e0e0", fontSize: 14, lineHeight: 22, flexShrink: 1 },
+  chatBubbleRole:   { color: "#3a5a7a", fontSize: 10, paddingHorizontal: 6, marginBottom: 2, fontWeight: "600" },
+  chatBubble:       { maxWidth: "85%", borderRadius: 18, padding: 14, flexShrink: 1 },
+  chatBubbleYou:    { backgroundColor: "#1a2a4a", borderWidth: 0 },
+  chatBubbleOther:  { backgroundColor: "#1e1e1e", borderWidth: 0 },
+  chatBubbleText:   { color: "#e8e8e8", fontSize: 15, lineHeight: 24, flexShrink: 1 },
   chatInputWrap:    { flexDirection: "row", gap: 8, padding: 10, borderBottomWidth: 0.5, borderBottomColor: "#1e1e1e", backgroundColor: "#000" },
   chatInputMulti:   { backgroundColor: "#111", borderRadius: 12, paddingHorizontal: 14, paddingVertical: 10, color: "#fff", fontSize: 14, borderWidth: 1, borderColor: "#2a2a2a", maxHeight: 120, minHeight: 44 },
   chatInput:        { flex: 1, height: 40, backgroundColor: "#111", borderRadius: 20, paddingHorizontal: 14, color: "#fff", fontSize: 14, borderWidth: 1, borderColor: "#2a2a2a" },

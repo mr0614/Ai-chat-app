@@ -27,9 +27,17 @@ export interface ChatEngineState {
 }
 
 const defaultState = (): ChatEngineState => ({
-  messages: [], topic: "", started: false, paused: false,
-  loading: false, turnCount: 0, sessionId: "",
-  personaId: "contrarian", toneId: "normal", error: "", waitingMsg: "",
+  messages: [],
+  topic: "",
+  started: false,
+  paused: false,
+  loading: false,
+  turnCount: 0,
+  sessionId: "",
+  personaId: "contrarian",
+  toneId: "normal",
+  error: "",
+  waitingMsg: "",
 });
 
 // ─── エンジン本体 ───────────────────────────────────────
@@ -41,7 +49,9 @@ class ChatEngine {
   // 外部から状態変化を購読できるようにする
   subscribe(fn: () => void): () => void {
     this.listeners.push(fn);
-    return () => { this.listeners = this.listeners.filter((f) => f !== fn); };
+    return () => {
+      this.listeners = this.listeners.filter((f) => f !== fn);
+    };
   }
 
   private notify() {
@@ -52,7 +62,9 @@ class ChatEngine {
     try {
       const j = await AsyncStorage.getItem(CHAT_STATE_KEY);
       return j ? JSON.parse(j) : defaultState();
-    } catch { return defaultState(); }
+    } catch {
+      return defaultState();
+    }
   }
 
   async setState(patch: Partial<ChatEngineState>): Promise<void> {
@@ -89,55 +101,101 @@ class ChatEngine {
     const INTERVAL = 4500;
     let lastGemini = 0;
 
-    await this.setState({ loading: true, paused: false, error: "", waitingMsg: "" });
+    await this.setState({
+      loading: true,
+      paused: false,
+      error: "",
+      waitingMsg: "",
+    });
 
-    const callModel = async (prompt: string, maxTokens: number): Promise<string> => {
+    const callModel = async (
+      prompt: string,
+      maxTokens: number,
+    ): Promise<string> => {
       if (model === "gemini") {
-        const key = await AsyncStorage.getItem("ai_apikey_gemini");
+        const rawKey = await AsyncStorage.getItem("ai_apikey_gemini");
+        const key = rawKey?.trim(); 
         if (!key) throw new Error("Gemini APIキーが未設定です");
 
-        // 【最重要】リクエスト開始時に、過去の連続実行による詰まりを回避するため、
-        // どんな場合でも必ず最低 8秒 のアイドリングを設ける（RPM制限の完全回避）
+        await this.recordGemini();
+
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${encodeURIComponent(key)}`;
+
         for (let attempt = 0; attempt < 3; attempt++) {
           if (this.aborted) return "";
 
           try {
-            const res = await fetch(
-              "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + key,
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  contents: [{ role: "user", parts: [{ text: prompt }] }],
-                  generationConfig: { maxOutputTokens: maxTokens }
-                })
-              }
-            );
+            const res = await fetch(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                contents: [{ role: "user", parts: [{ text: prompt }] }],
+                generationConfig: { maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } },
+              }),
+            });
 
-            if (res.status === 429) {
-              // 429が出たら、さらに長い 30秒 の「反省時間」を設ける
-              console.warn("[Gemini] 429 detected. Sleeping for 30s...");
-              await this.setState({ waitingMsg: "Gemini: 制限解除待ち(30s)..." });
-              await new Promise((r) => setTimeout(r, 30000));
-              continue;
+            // 成功・失敗に関わらずステータスコードをログ出力
+
+            if (!res.ok) {
+              const text = await res.text();
+              // ここでエラーを投げてループを継続させる
+              throw new Error(`Gemini API error ${res.status}: ${text}`);
             }
-
-            if (!res.ok) throw new Error("Gemini API Error: " + res.status);
 
             const d = await res.json();
             return d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
           } catch (e) {
             if (attempt === 2) throw e;
+            await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+          }
+        }
+
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (this.aborted) return "";
+
+          try {
+            const res = await fetch(url, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json", 
+              },
+              body: JSON.stringify({
+                contents: [{ role: "user", parts: [{ text: prompt }] }],
+                generationConfig: { maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } },
+              }),
+            });
+
+            if (!res.ok) {
+              const errorData = await res.json();
+              // 400エラーの原因の多くはキーの無効化か形式ミス
+              throw new Error(
+                "Gemini API error: " +
+                  (errorData.error?.message || res.statusText),
+              );
+            }
+
+            const d = await res.json();
+            return d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
+          } catch (e) {
+            if (attempt === 2) throw e;
+            await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
           }
         }
       }
 
       if (model === "openai") {
-        const key = apiKeys.openai || ""; // ここもブロック内なので const key でOK
+        const key = apiKeys.openai || ""; 
         const res = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
-          body: JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: prompt }], max_tokens: maxTokens }),
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer " + key,
+          },
+          body: JSON.stringify({
+            model: "gpt-4o-mini",
+            messages: [{ role: "user", content: prompt }],
+            max_tokens: maxTokens,
+          }),
         });
         const d = await res.json();
         if (!res.ok) throw new Error("OpenAI " + res.status);
@@ -146,11 +204,21 @@ class ChatEngine {
 
       // Claude
       {
-        const key = apiKeys.claude || process.env.EXPO_PUBLIC_ANTHROPIC_API_KEY || "";
+        const key =
+          apiKeys.claude || process.env.EXPO_PUBLIC_ANTHROPIC_API_KEY || "";
         const res = await fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
-          headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01", "anthropic-dangerous-request-allowed": "true" },
-          body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] }),
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "anthropic-dangerous-request-allowed": "true",
+          },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-20250514",
+            max_tokens: maxTokens,
+            messages: [{ role: "user", content: prompt }],
+          }),
         });
         const d = await res.json();
         if (!res.ok) throw new Error("Claude " + res.status);
@@ -176,22 +244,36 @@ class ChatEngine {
       for (let t = 0; t < turns; t++) {
         if (this.aborted) break;
         currentState = await this.getState();
-        const history = msgs
-          .filter((m) => m.role !== "topic")
-          .slice(-6)
-          .map((m) => (m.role === "you" ? "あなたAI" : "相手AI") + ": " + m.text)
-          .join(" / ") || "なし";
+        const history =
+          msgs
+            .filter((m) => m.role !== "topic")
+            .slice(-6)
+            .map(
+              (m) => (m.role === "you" ? "あなたAI" : "相手AI") + ": " + m.text,
+            )
+            .join(" / ") || "なし";
 
-        const variation = variations[Math.floor(Math.random() * variations.length)];
+        const variation =
+          variations[Math.floor(Math.random() * variations.length)];
 
         // あなたAI
-        const topicText = currentState.topic || msgs.find((m) => m.role === "topic")?.text || "";
-        const youPrompt = "あなたは自然な口語で話す人物です。" +
-          " 【議題】" + topicText +
-          " 【会話履歴】" + history +
+        const topicText =
+          currentState.topic ||
+          msgs.find((m) => m.role === "topic")?.text ||
+          "";
+        const youPrompt =
+          "あなたは自然な口語で話す人物です。" +
+          " 【議題】" +
+          topicText +
+          " 【会話履歴】" +
+          history +
           " 1〜2文で自分の視点を返す。「じゃん」「だよね」「かな」などの口語で。分析・箇条書き禁止。";
 
-        const youPlaceholder: EngineMessage = { role: "you", text: "", streaming: true };
+        const youPlaceholder: EngineMessage = {
+          role: "you",
+          text: "",
+          streaming: true,
+        };
         msgs = [...msgs, youPlaceholder];
         onMessage(youPlaceholder);
 
@@ -212,13 +294,24 @@ class ChatEngine {
         await new Promise((r) => setTimeout(r, 300));
 
         // 相手AI
-        const otherPrompt = personaPrompt +
+        const otherPrompt =
+          personaPrompt +
           " 話し方: 自然な口語。毎回違う切り口。同じ言い回しを繰り返さない。" +
-          " 【議題】" + topicText +
-          " 【会話履歴】" + history + " / あなたAI: " + youText +
-          " " + variation + " 1〜2文。";
+          " 【議題】" +
+          topicText +
+          " 【会話履歴】" +
+          history +
+          " / あなたAI: " +
+          youText +
+          " " +
+          variation +
+          " 1〜2文。";
 
-        const otherPlaceholder: EngineMessage = { role: "other", text: "", streaming: true };
+        const otherPlaceholder: EngineMessage = {
+          role: "other",
+          text: "",
+          streaming: true,
+        };
         msgs = [...msgs, otherPlaceholder];
         await this.setState({ messages: msgs });
         onMessage(otherPlaceholder);
@@ -250,7 +343,12 @@ class ChatEngine {
         error: "",
       });
     } catch (e: any) {
-      await this.setState({ loading: false, paused: true, error: e?.message ?? "エラーが発生しました", waitingMsg: "" });
+      await this.setState({
+        loading: false,
+        paused: true,
+        error: e?.message ?? "エラーが発生しました",
+        waitingMsg: "",
+      });
     }
     this.running = false;
     this.notify();
@@ -259,25 +357,45 @@ class ChatEngine {
   private async recordGemini(): Promise<void> {
     try {
       const j = await AsyncStorage.getItem("ai_usage_stats");
-      const u = j ? JSON.parse(j) : { gemini: { minuteRequests: 0, minuteStart: Date.now(), totalRequests: 0 }, claude: { inputTokens: 0, outputTokens: 0, cost: 0 }, openai: { inputTokens: 0, outputTokens: 0, cost: 0 } };
+      const u = j ? JSON.parse(j) : { gemini: { minuteRequests: 0, minuteStart: Date.now(), totalRequests: 0, timestamps: [] }, claude: { inputTokens: 0, outputTokens: 0, cost: 0 }, openai: { inputTokens: 0, outputTokens: 0, cost: 0 } };
       const now = Date.now();
-      if (now - u.gemini.minuteStart > 60000) { u.gemini.minuteRequests = 1; u.gemini.minuteStart = now; }
-      else u.gemini.minuteRequests += 1;
+      if (!u.gemini.timestamps) u.gemini.timestamps = [];
+      u.gemini.timestamps = [...u.gemini.timestamps.filter((t: number) => now - t < 60000), now];
+      u.gemini.minuteRequests = u.gemini.timestamps.length;
+      u.gemini.minuteStart = u.gemini.timestamps[0] ?? now;
       u.gemini.totalRequests += 1;
       await AsyncStorage.setItem("ai_usage_stats", JSON.stringify(u));
-    } catch { }
+    } catch {}
   }
 
-  private async recordTokens(model: "claude" | "openai", input: number, output: number): Promise<void> {
+  private async recordTokens(
+    model: "claude" | "openai",
+    input: number,
+    output: number,
+  ): Promise<void> {
     try {
-      const pricing = { claude: { input: 3 / 1e6, output: 15 / 1e6 }, openai: { input: 0.15 / 1e6, output: 0.60 / 1e6 } };
+      const pricing = {
+        claude: { input: 3 / 1e6, output: 15 / 1e6 },
+        openai: { input: 0.15 / 1e6, output: 0.6 / 1e6 },
+      };
       const j = await AsyncStorage.getItem("ai_usage_stats");
-      const u = j ? JSON.parse(j) : { gemini: { minuteRequests: 0, minuteStart: Date.now(), totalRequests: 0 }, claude: { inputTokens: 0, outputTokens: 0, cost: 0 }, openai: { inputTokens: 0, outputTokens: 0, cost: 0 } };
+      const u = j
+        ? JSON.parse(j)
+        : {
+            gemini: {
+              minuteRequests: 0,
+              minuteStart: Date.now(),
+              totalRequests: 0,
+            },
+            claude: { inputTokens: 0, outputTokens: 0, cost: 0 },
+            openai: { inputTokens: 0, outputTokens: 0, cost: 0 },
+          };
       u[model].inputTokens += input;
       u[model].outputTokens += output;
-      u[model].cost += input * pricing[model].input + output * pricing[model].output;
+      u[model].cost +=
+        input * pricing[model].input + output * pricing[model].output;
       await AsyncStorage.setItem("ai_usage_stats", JSON.stringify(u));
-    } catch { }
+    } catch {}
   }
 }
 
