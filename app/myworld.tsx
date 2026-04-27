@@ -76,11 +76,13 @@ const discovery = {
 
 // ─── 型 ──────────────────────────────────────────────────────────────────────
 interface ListItem {
-  id:        string;
-  title:     string;
-  subtitle?: string;
-  imageUrl?: string;
-  category:  CategoryId;
+  id:          string;
+  title:       string;
+  subtitle?:   string;
+  imageUrl?:   string;
+  category:    CategoryId;
+  isSeries?:   boolean;   // シリーズまとめ登録フラグ
+  seriesCount?: number;   // シーズン数 or 巻数
 }
 
 interface CastMember {
@@ -296,94 +298,85 @@ function ZoomableImage({ uri }: { uri: string }) {
 }
 
 // ─── 詳細モーダル ─────────────────────────────────────────────────────────────
+type NavEntry =
+  | { type: "detail"; item: ItemDetail }
+  | { type: "person"; id: number; name: string; castList: ListItem[]; directedList: ListItem[]; tab: "cast" | "directed" };
+
 function DetailModal({ initialItem, onClose, onAddToList, alreadyAdded }: {
   initialItem: ItemDetail | null; onClose: () => void;
   onAddToList: (item: ListItem) => void; alreadyAdded: (id: string) => boolean;
 }) {
   const insets = useSafeAreaInsets();
-  const [stack,         setStack]         = useState<ItemDetail[]>([]);
-  const [personView,    setPersonView]    = useState<{ id: number; name: string } | null>(null);
-  const [castList,      setCastList]      = useState<ListItem[]>([]);
-  const [directedList,  setDirectedList]  = useState<ListItem[]>([]);
-  const [loadingPerson, setLoadingPerson] = useState(false);
-  const [loadingDetail, setLoadingDetail] = useState(false);
-  const [personTab,     setPersonTab]     = useState<"cast" | "directed">("cast");
+  const [navStack, setNavStack] = useState<NavEntry[]>([]);
+  const [loading,  setLoading]  = useState(false);
 
-  useEffect(() => { if (initialItem) { setStack([initialItem]); setPersonView(null); } }, [initialItem]);
+  useEffect(() => { if (initialItem) setNavStack([{ type: "detail", item: initialItem }]); }, [initialItem]);
 
-  if (!initialItem) return null;
-  const current = stack[stack.length - 1];
-  const backTop = insets.top + 12;
+  if (!initialItem || navStack.length === 0) return null;
+  const current = navStack[navStack.length - 1];
 
-  const handlePersonTap = async (p: CastMember) => {
-    setPersonView({ id: p.id, name: p.name }); setPersonTab("cast"); setLoadingPerson(true);
-    const { cast, directed } = await fetchPersonCredits(p.id);
-    setCastList(cast); setDirectedList(directed); setLoadingPerson(false);
-  };
-
-  const handleDirectorTap = async (id: number, name: string) => {
-    setPersonView({ id, name }); setPersonTab("directed"); setLoadingPerson(true);
+  const pushPerson = async (id: number, name: string, defaultTab: "cast" | "directed") => {
+    setLoading(true);
     const { cast, directed } = await fetchPersonCredits(id);
-    setCastList(cast); setDirectedList(directed); setLoadingPerson(false);
+    setNavStack((prev) => [...prev, { type: "person", id, name, castList: cast, directedList: directed, tab: defaultTab }]);
+    setLoading(false);
   };
 
-  const handleFilmTap = async (film: ListItem) => {
+  const pushDetail = async (film: ListItem) => {
     if (film.category !== "video") return;
-    setLoadingDetail(true);
+    setLoading(true);
     const isTV = film.id.startsWith("tv_");
     const nid  = film.id.replace(/^(movie|tv)_/, "");
     const detail = await fetchTMDBDetail(isTV ? "tv" : "movie", nid);
-    setStack((p) => [...p, { ...film, cast: [], ...detail } as ItemDetail]);
-    setPersonView(null); setLoadingDetail(false);
+    setNavStack((prev) => [...prev, { type: "detail", item: { ...film, cast: [], ...detail } as ItemDetail }]);
+    setLoading(false);
   };
 
-  const handleBack = () => {
-    if (personView) setPersonView(null);
-    else if (stack.length > 1) setStack((p) => p.slice(0, -1));
+  const setPersonTab = (tab: "cast" | "directed") => {
+    setNavStack((prev) => {
+      const last = prev[prev.length - 1];
+      if (last.type !== "person") return prev;
+      return [...prev.slice(0, -1), { ...last, tab }];
+    });
   };
+
+  const handleBack = () => setNavStack((prev) => prev.slice(0, -1));
 
   return (
     <Modal visible animationType="slide" transparent>
       <GestureHandlerRootView style={{ flex: 1 }}>
         <View style={styles.modalBg}>
-          {(loadingDetail || loadingPerson) && (
-            <View style={styles.modalLoadingOverlay}><ActivityIndicator color="#fff" size="large" /></View>
-          )}
+          {loading && <View style={styles.modalLoadingOverlay}><ActivityIndicator color="#fff" size="large" /></View>}
 
-          {!personView && current && (
+          {current.type === "detail" && (
             <ScrollView style={styles.modalScroll} contentContainerStyle={[styles.modalScrollContent, { paddingTop: insets.top + 20 }]} showsVerticalScrollIndicator={false}>
-              {current.imageUrl
-                ? <ZoomableImage uri={current.fullImageUrl ?? current.imageUrl} />
-                : <View style={styles.modalNoImage}><Text style={{ fontSize: 48 }}>{CATEGORY_LABELS[current.category]?.slice(0, 1)}</Text></View>
+              {current.item.imageUrl
+                ? <ZoomableImage uri={current.item.fullImageUrl ?? current.item.imageUrl} />
+                : <View style={styles.modalNoImage}><Text style={{ fontSize: 48 }}>{CATEGORY_LABELS[current.item.category]?.slice(0, 1)}</Text></View>
               }
-              <Text style={styles.modalTitle}>{current.title}</Text>
-              {current.subtitle && <Text style={styles.modalYear}>{current.subtitle}</Text>}
-              <TouchableOpacity style={[styles.addBtn, alreadyAdded(current.id) && styles.addBtnDone]} onPress={() => onAddToList(current)}>
-                <Text style={styles.addBtnText}>{alreadyAdded(current.id) ? "✓ 追加済み" : "+ マイリストに追加"}</Text>
+              <Text style={styles.modalTitle}>{current.item.title}</Text>
+              {current.item.subtitle && <Text style={styles.modalYear}>{current.item.subtitle}</Text>}
+              <TouchableOpacity style={[styles.addBtn, alreadyAdded(current.item.id) && styles.addBtnDone]} onPress={() => onAddToList(current.item)}>
+                <Text style={styles.addBtnText}>{alreadyAdded(current.item.id) ? "✓ 追加済み" : "+ マイリストに追加"}</Text>
               </TouchableOpacity>
-              {current.director && (
+              {current.item.director && (
                 <View style={styles.castSection}>
                   <Text style={styles.castLabel}>監督</Text>
                   <View style={styles.castList}>
-                    <TouchableOpacity
-                      style={styles.castChip}
-                      onPress={() => current.directorId && handleDirectorTap(current.directorId, current.director!)}
-                    >
-                      {current.directorProfileUrl && (
-                        <Image source={{ uri: current.directorProfileUrl }} style={styles.castAvatar} />
-                      )}
-                      <Text style={styles.castName}>{current.director}</Text>
+                    <TouchableOpacity style={styles.castChip} onPress={() => current.item.directorId && pushPerson(current.item.directorId, current.item.director!, "directed")}>
+                      {current.item.directorProfileUrl && <Image source={{ uri: current.item.directorProfileUrl }} style={styles.castAvatar} />}
+                      <Text style={styles.castName}>{current.item.director}</Text>
                     </TouchableOpacity>
                   </View>
                 </View>
               )}
-              {current.overview ? <Text style={styles.overview} numberOfLines={5}>{current.overview}</Text> : null}
-              {current.cast.length > 0 && (
+              {current.item.overview ? <Text style={styles.overview} numberOfLines={5}>{current.item.overview}</Text> : null}
+              {current.item.cast.length > 0 && (
                 <View style={styles.castSection}>
                   <Text style={styles.castLabel}>出演者</Text>
                   <View style={styles.castList}>
-                    {current.cast.map((p) => (
-                      <TouchableOpacity key={p.id} style={styles.castChip} onPress={() => handlePersonTap(p)}>
+                    {current.item.cast.map((p) => (
+                      <TouchableOpacity key={p.id} style={styles.castChip} onPress={() => pushPerson(p.id, p.name, "cast")}>
                         {p.profileUrl && <Image source={{ uri: p.profileUrl }} style={styles.castAvatar} />}
                         <View>
                           <Text style={styles.castName}>{p.name}</Text>
@@ -397,45 +390,42 @@ function DetailModal({ initialItem, onClose, onAddToList, alreadyAdded }: {
             </ScrollView>
           )}
 
-          {personView && (
+          {current.type === "person" && (
             <View style={[styles.filmoContainer, { paddingTop: insets.top + 20 }]}>
-              <Text style={styles.filmoPersonName}>{personView.name}</Text>
+              <Text style={styles.filmoPersonName}>{current.name}</Text>
               <View style={styles.filmoTabRow}>
-                <TouchableOpacity style={[styles.filmoTab, personTab === "cast" && styles.filmoTabActive]} onPress={() => setPersonTab("cast")}>
-                  <Text style={[styles.filmoTabText, personTab === "cast" && styles.filmoTabTextActive]}>出演作</Text>
+                <TouchableOpacity style={[styles.filmoTab, current.tab === "cast" && styles.filmoTabActive]} onPress={() => setPersonTab("cast")}>
+                  <Text style={[styles.filmoTabText, current.tab === "cast" && styles.filmoTabTextActive]}>出演作</Text>
                 </TouchableOpacity>
-                {directedList.length > 0 && (
-                  <TouchableOpacity style={[styles.filmoTab, personTab === "directed" && styles.filmoTabActive]} onPress={() => setPersonTab("directed")}>
-                    <Text style={[styles.filmoTabText, personTab === "directed" && styles.filmoTabTextActive]}>監督作</Text>
+                {current.directedList.length > 0 && (
+                  <TouchableOpacity style={[styles.filmoTab, current.tab === "directed" && styles.filmoTabActive]} onPress={() => setPersonTab("directed")}>
+                    <Text style={[styles.filmoTabText, current.tab === "directed" && styles.filmoTabTextActive]}>監督作</Text>
                   </TouchableOpacity>
                 )}
               </View>
-              {loadingPerson ? <ActivityIndicator color="#fff" style={{ marginTop: 40 }} /> : (
-                <FlatList
-                  data={personTab === "cast" ? castList : directedList}
-                  keyExtractor={(item) => item.id}
-                  contentContainerStyle={{ paddingBottom: 120 }}
-                  renderItem={({ item: film }) => (
-                    <TouchableOpacity style={styles.filmoRow} onPress={() => handleFilmTap(film)}>
-                      {film.imageUrl
-                        ? <Image source={{ uri: film.imageUrl }} style={styles.filmoThumb} />
-                        : <View style={[styles.filmoThumb, styles.noImage]}><Text style={{ fontSize: 14 }}>🎬</Text></View>
-                      }
-                      <View style={styles.filmoText}>
-                        <Text style={styles.filmoName} numberOfLines={2}>{film.title}</Text>
-                        {film.subtitle && <Text style={styles.filmoSub} numberOfLines={1}>{film.subtitle}</Text>}
-                      </View>
-                      <Text style={styles.filmoArrow}>›</Text>
-                    </TouchableOpacity>
-                  )}
-                />
-              )}
+              <FlatList
+                data={current.tab === "cast" ? current.castList : current.directedList}
+                keyExtractor={(item) => item.id}
+                contentContainerStyle={{ paddingBottom: 120 }}
+                renderItem={({ item: film }) => (
+                  <TouchableOpacity style={styles.filmoRow} onPress={() => pushDetail(film)}>
+                    {film.imageUrl
+                      ? <Image source={{ uri: film.imageUrl }} style={styles.filmoThumb} />
+                      : <View style={[styles.filmoThumb, styles.noImage]}><Text style={{ fontSize: 14 }}>🎬</Text></View>
+                    }
+                    <View style={styles.filmoText}>
+                      <Text style={styles.filmoName} numberOfLines={2}>{film.title}</Text>
+                      {film.subtitle && <Text style={styles.filmoSub} numberOfLines={1}>{film.subtitle}</Text>}
+                    </View>
+                    <Text style={styles.filmoArrow}>›</Text>
+                  </TouchableOpacity>
+                )}
+              />
             </View>
           )}
 
-          {/* 左下ボタンエリア：戻る（条件付き）＋ 閉じる */}
           <View style={[styles.modalBottomBtns, { bottom: insets.bottom + 24 }]}>
-            {(stack.length > 1 || personView) && (
+            {navStack.length > 1 && (
               <TouchableOpacity style={styles.modalBottomBtn} onPress={handleBack}>
                 <Text style={styles.modalBottomBtnText}>← 戻る</Text>
               </TouchableOpacity>
@@ -444,7 +434,6 @@ function DetailModal({ initialItem, onClose, onAddToList, alreadyAdded }: {
               <Text style={styles.modalBottomBtnText}>✕ 閉じる</Text>
             </TouchableOpacity>
           </View>
-
         </View>
       </GestureHandlerRootView>
     </Modal>
@@ -506,7 +495,7 @@ export default function MyWorldScreen() {
       `?client_id=${SPOTIFY_CLIENT_ID}` +
       `&response_type=code` +
       `&redirect_uri=${encodeURIComponent(spotifyRedirect)}` +
-      `&scope=user-read-email%20user-library-read` +
+      `&scope=user-read-email%20user-library-read%20user-top-read%20user-read-recently-played` +
       `&code_challenge_method=S256` +
       `&code_challenge=${codeChallenge}`;
 
@@ -529,7 +518,10 @@ export default function MyWorldScreen() {
         }).toString(),
       });
       const tokenData = await tokenRes.json();
-      if (tokenData.access_token) setSpotifyToken(tokenData.access_token);
+      if (tokenData.access_token) {
+        setSpotifyToken(tokenData.access_token);
+        importFromSpotify(tokenData.access_token);
+      }
     }
   };
 
@@ -549,6 +541,57 @@ export default function MyWorldScreen() {
   // ── 起動時キャッシュ構築 ──
   useEffect(() => {
     warmUpCache().finally(() => setCacheReady(true));
+  }, []);
+
+  // ── Spotify取り込み（トークン取得後に自動実行）──
+  const importFromSpotify = useCallback(async (token: string) => {
+    try {
+      const [topRes, recentRes] = await Promise.all([
+        axios.get("https://api.spotify.com/v1/me/top/tracks", {
+          headers: { Authorization: `Bearer ${token}` },
+          params:  { limit: 20, time_range: "medium_term" },
+        }),
+        axios.get("https://api.spotify.com/v1/me/player/recently-played", {
+          headers: { Authorization: `Bearer ${token}` },
+          params:  { limit: 20 },
+        }),
+      ]);
+
+      const topItems: ListItem[] = (topRes.data.items ?? []).map((t: any) => ({
+        id:       `music_track_${t.id}`,
+        title:    `${t.name} — ${t.artists?.map((a: any) => a.name).join(", ")}`,
+        subtitle: "Spotifyトップ曲",
+        imageUrl: t.album?.images?.[2]?.url,
+        category: "music" as CategoryId,
+      }));
+
+      const recentItems: ListItem[] = (recentRes.data.items ?? []).map((item: any) => ({
+        id:       `music_track_${item.track.id}`,
+        title:    `${item.track.name} — ${item.track.artists?.map((a: any) => a.name).join(", ")}`,
+        subtitle: "最近再生",
+        imageUrl: item.track.album?.images?.[2]?.url,
+        category: "music" as CategoryId,
+      }));
+
+      // 既存リストをAsyncStorageから直接読んで重複除去してから保存
+      const existingJson = await AsyncStorage.getItem("myworld_list");
+      const existing: ListItem[] = existingJson ? JSON.parse(existingJson) : [];
+      const existingIds = new Set(existing.map((m) => m.id));
+      const seenIds = new Set<string>();
+      const newItems = [...topItems, ...recentItems].filter((item) => {
+        if (seenIds.has(item.id) || existingIds.has(item.id)) return false;
+        seenIds.add(item.id);
+        return true;
+      });
+
+      if (newItems.length > 0) {
+        const merged = [...newItems, ...existing];
+        await AsyncStorage.setItem("myworld_list", JSON.stringify(merged));
+        setMyList(merged);
+      }
+    } catch (e) {
+      console.warn("Spotify import error:", e);
+    }
   }, []);
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -590,15 +633,32 @@ export default function MyWorldScreen() {
           const res = await axios.get("https://api.themoviedb.org/3/search/multi", {
             params: { api_key: TMDB_KEY, query: text, language: "ja-JP" },
           });
-          apiItems = (res.data.results ?? [])
-            .filter((r: any) => r.media_type === "movie" || r.media_type === "tv")
-            .map((item: any) => ({
-              id:       `${item.media_type}_${item.id}`,
-              title:    item.title ?? item.name ?? "",
-              subtitle: (item.release_date ?? item.first_air_date)?.slice(0, 4),
-              imageUrl: item.poster_path ? `https://image.tmdb.org/t/p/w200${item.poster_path}` : undefined,
-              category: "video" as CategoryId,
-            }));
+          const raw = (res.data.results ?? []).filter((r: any) => r.media_type === "movie" || r.media_type === "tv");
+
+          // TV番組にはシーズン数を取得してシリーズとして扱う
+          apiItems = raw.map((item: any) => {
+            const isTV       = item.media_type === "tv";
+            const seasons    = item.number_of_seasons;
+            const isSeries   = isTV && (seasons > 1 || item.number_of_episodes > 12);
+            return {
+              id:          `${item.media_type}_${item.id}`,
+              title:       item.title ?? item.name ?? "",
+              subtitle:    isTV
+                ? (seasons ? `全${seasons}シーズン` : (item.first_air_date?.slice(0, 4) ?? ""))
+                : (item.release_date?.slice(0, 4) ?? ""),
+              imageUrl:    item.poster_path ? `https://image.tmdb.org/t/p/w200${item.poster_path}` : undefined,
+              category:    "video" as CategoryId,
+              isSeries,
+              seriesCount: seasons,
+            };
+          });
+
+          // シリーズを上位に並び替え
+          apiItems.sort((a, b) => {
+            if (a.isSeries && !b.isSeries) return -1;
+            if (!a.isSeries && b.isSeries) return 1;
+            return 0;
+          });
         }
         if (activeTab === "book") {
           const res = await axios.get("https://www.googleapis.com/books/v1/volumes", {
@@ -714,7 +774,9 @@ export default function MyWorldScreen() {
     setActiveTab(id);
   };
 
-  const filteredList = activeTab === "all" ? myList : myList.filter((m) => m.category === activeTab as CategoryId);
+  // idの重複をレンダリング前に除去（Spotifyの同一曲がtop/recentで重複した場合の対策）
+  const dedupedList = myList.filter((m, i, arr) => arr.findIndex((x) => x.id === m.id) === i);
+  const filteredList = activeTab === "all" ? dedupedList : dedupedList.filter((m) => m.category === activeTab as CategoryId);
   const overlayMaxHeight = keyboardHeight > 0 ? screenHeight - keyboardHeight - 130 : 420;
 
   return (
@@ -733,7 +795,15 @@ export default function MyWorldScreen() {
             autoCorrect={false}
             autoCapitalize="none"
           />
-          {(!cacheReady || detailLoading) && <ActivityIndicator color="#fff" style={{ marginLeft: 10 }} />}
+          {query.length > 0 && (
+            <TouchableOpacity
+              style={styles.clearBtn}
+              onPress={() => { closeResults(); setQuery(""); inputRef.current?.focus(); }}
+            >
+              <Text style={styles.clearBtnText}>✕</Text>
+            </TouchableOpacity>
+          )}
+          {(!cacheReady || detailLoading) && <ActivityIndicator color="#fff" style={{ marginLeft: 6 }} />}
         </View>
 
         {/* 候補ウィンドウ外タップで閉じる */}
@@ -760,7 +830,14 @@ export default function MyWorldScreen() {
                   <View style={styles.cardText}>
                     <View style={styles.cardTitleRow}>
                       <Text style={styles.cardTitle} numberOfLines={1}>{item.title}</Text>
-                      {activeTab === "all" && <Text style={styles.cardCatBadge}>{CATEGORY_LABELS[item.category]}</Text>}
+                      {item.isSeries && (
+                        <View style={styles.seriesBadge}>
+                          <Text style={styles.seriesBadgeTxt}>シリーズ</Text>
+                        </View>
+                      )}
+                      {activeTab === "all" && !item.isSeries && (
+                        <Text style={styles.cardCatBadge}>{CATEGORY_LABELS[item.category]}</Text>
+                      )}
                     </View>
                     {item.subtitle && <Text style={styles.cardSubtitle} numberOfLines={1}>{item.subtitle}</Text>}
                   </View>
@@ -843,6 +920,8 @@ const styles = StyleSheet.create({
 
   searchRow:  { flexDirection: "row", alignItems: "center", marginHorizontal: 12, marginBottom: 4, zIndex: 10 },
   input:      { flex: 1, height: 48, backgroundColor: "#1a1a1a", borderRadius: 24, paddingHorizontal: 20, color: "#fff", fontSize: 15, borderWidth: 1, borderColor: "#333" },
+  clearBtn:      { width: 32, height: 32, borderRadius: 16, backgroundColor: "#2a2a2a", justifyContent: "center", alignItems: "center", marginLeft: 8 },
+  clearBtnText:  { color: "#888", fontSize: 13 },
 
   dismissLayer:  { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, zIndex: 8 },
   searchOverlay: { marginHorizontal: 12, backgroundColor: "#111", borderRadius: 12, borderWidth: 1, borderColor: "#222", zIndex: 9 },
@@ -854,6 +933,8 @@ const styles = StyleSheet.create({
   cardTitle:    { color: "#fff", fontSize: 14, fontWeight: "600", flex: 1 },
   cardCatBadge: { color: "#888", fontSize: 11, borderWidth: 1, borderColor: "#333", borderRadius: 4, paddingHorizontal: 4, paddingVertical: 1 },
   cardSubtitle: { color: "#666", fontSize: 12, marginTop: 2 },
+  seriesBadge:    { backgroundColor: "#1a1a3a", borderRadius: 4, paddingHorizontal: 6, paddingVertical: 2, borderWidth: 1, borderColor: "#333" },
+  seriesBadgeTxt: { color: "#7eb8ff", fontSize: 10, fontWeight: "700" },
 
   rowFront:    { flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 10, backgroundColor: "#000", borderBottomWidth: 1, borderBottomColor: "#111" },
   rowBack:     { alignItems: "flex-end", justifyContent: "center", flex: 1, backgroundColor: "#ff3b30", paddingRight: 24 },
