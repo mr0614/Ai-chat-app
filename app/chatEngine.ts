@@ -117,8 +117,6 @@ class ChatEngine {
         const key = rawKey?.trim(); 
         if (!key) throw new Error("Gemini APIキーが未設定です");
 
-        await this.recordGemini();
-
         const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${encodeURIComponent(key)}`;
 
         for (let attempt = 0; attempt < 3; attempt++) {
@@ -136,12 +134,19 @@ class ChatEngine {
 
             // 成功・失敗に関わらずステータスコードをログ出力
 
+            if (res.status === 429 || res.status === 503) {
+              const waitSec = res.status === 503 ? 10 : 30;
+              await this.setState({ waitingMsg: (res.status === 429 ? "Gemini 429" : "Gemini 503") + ": " + waitSec + "秒待機中..." });
+              await new Promise((r) => setTimeout(r, waitSec * 1000));
+              await this.setState({ waitingMsg: "" });
+              continue;
+            }
             if (!res.ok) {
               const text = await res.text();
-              // ここでエラーを投げてループを継続させる
-              throw new Error(`Gemini API error ${res.status}: ${text}`);
+              throw new Error("Gemini API error " + res.status + ": " + text);
             }
 
+            this.recordGemini().catch(() => {});
             const d = await res.json();
             return d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
           } catch (e) {
@@ -247,7 +252,7 @@ class ChatEngine {
         const history =
           msgs
             .filter((m) => m.role !== "topic")
-            .slice(-6)
+            .slice(-4)
             .map(
               (m) => (m.role === "you" ? "あなたAI" : "相手AI") + ": " + m.text,
             )
@@ -285,7 +290,7 @@ class ChatEngine {
           if (this.aborted) break;
           youStreamed += ch;
           onMessage({ role: "you", text: youStreamed, streaming: true });
-          await new Promise((r) => setTimeout(r, 50));
+          await new Promise((r) => setTimeout(r, 30));
         }
         const youMsg: EngineMessage = { role: "you", text: youText };
         msgs = [...msgs.slice(0, -1), youMsg];
@@ -324,7 +329,7 @@ class ChatEngine {
           if (this.aborted) break;
           otherStreamed += ch;
           onMessage({ role: "other", text: otherStreamed, streaming: true });
-          await new Promise((r) => setTimeout(r, 50));
+          await new Promise((r) => setTimeout(r, 30));
         }
         const otherMsg: EngineMessage = { role: "other", text: otherText };
         msgs = [...msgs.slice(0, -1), otherMsg];

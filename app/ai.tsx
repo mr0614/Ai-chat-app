@@ -206,7 +206,7 @@ class ChatEngine {
         console.log("[ChatEngine] turn", t + 1, "of", turns);
         const history = msgs
           .filter((m: any) => m.role !== "topic")
-          .slice(-6)
+          .slice(-4)
           .map((m: any) => (m.role === "you" ? "あなたAI" : "相手AI") + ": " + m.text)
           .join(" / ") || "なし";
 
@@ -289,10 +289,12 @@ class ChatEngine {
   private async recordGemini(): Promise<void> {
     try {
       const j = await AsyncStorage.getItem("ai_usage_stats");
-      const u = j ? JSON.parse(j) : { gemini: { minuteRequests: 0, minuteStart: Date.now(), totalRequests: 0 }, claude: { inputTokens: 0, outputTokens: 0, cost: 0 }, openai: { inputTokens: 0, outputTokens: 0, cost: 0 } };
+      const u = j ? JSON.parse(j) : { gemini: { minuteRequests: 0, minuteStart: Date.now(), totalRequests: 0, timestamps: [] }, claude: { inputTokens: 0, outputTokens: 0, cost: 0 }, openai: { inputTokens: 0, outputTokens: 0, cost: 0 } };
       const now = Date.now();
-      if (now - u.gemini.minuteStart > 60000) { u.gemini.minuteRequests = 1; u.gemini.minuteStart = now; }
-      else u.gemini.minuteRequests += 1;
+      if (!u.gemini.timestamps) u.gemini.timestamps = [];
+      u.gemini.timestamps = [...u.gemini.timestamps.filter((t: number) => now - t < 60000), now];
+      u.gemini.minuteRequests = u.gemini.timestamps.length;
+      u.gemini.minuteStart = u.gemini.timestamps[0] ?? now;
       u.gemini.totalRequests += 1;
       await AsyncStorage.setItem("ai_usage_stats", JSON.stringify(u));
     } catch {}
@@ -440,13 +442,33 @@ async function pseudoStream(
   let full = "";
 
   if (model === "gemini") {
+    // pseudoStreamはGeminiのレート制限節約のためClaudeを使用
+    const claudeKey = apiKey || process.env.EXPO_PUBLIC_ANTHROPIC_API_KEY || "";
+    const claudeText = await (async () => {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": claudeKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-request-allowed": "true" },
+        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] }),
+      });
+      const d = await res.json();
+      return d.content?.[0]?.text?.trim() ?? "";
+    })();
+    if (claudeText) {
+      let sent = "";
+      for (const char of claudeText) {
+        if (abortRef.current) break;
+        sent += char;
+        onChunk(char, sent);
+        await new Promise((r) => setTimeout(r, 18));
+      }
+      return claudeText;
+    }
+    // Claudeが使えない場合のみGeminiを試す
     const key = apiKey || process.env.EXPO_PUBLIC_GEMINI_API_KEY || "";
-    if (!key) throw new Error("GeminiのAPIキーが未設定です\naistudio.google.comで無料取得できます");
-    // 429レート制限時は最大3回リトライ（指数バックオフ）
+    if (!key) throw new Error("APIキーが未設定です");
     let lastErr = "";
     for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt > 0) await new Promise((r) => setTimeout(r, 1500 * attempt));
-      await geminiRateLimit();
       const res = await fetch(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" + key,
         { method: "POST", headers: { "Content-Type": "application/json" },
@@ -501,7 +523,7 @@ async function pseudoStream(
   return full;
 }
 
-const TURNS_PER_BLOCK = 3;
+const TURNS_PER_BLOCK = 2;
 const USAGE_KEY = "ai_usage_stats";
 
 // Claude: $3/1M input, $15/1M output
@@ -577,21 +599,21 @@ async function callWithModel(
 ): Promise<string> {
   if (model === "gemini") {
     const key = apiKey || process.env.EXPO_PUBLIC_GEMINI_API_KEY || "";
-    if (!key) return await callClaude([{ role: "user", content: prompt }], maxTokens); // fallback
+    if (!key) throw new Error("GeminiのAPIキーが未設定です");
     for (let attempt = 0; attempt < 3; attempt++) {
-      if (attempt > 0) await new Promise((r) => setTimeout(r, 2000 * attempt));
-      await geminiRateLimit(); // 4.5秒インターバルを強制
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 3000 * attempt));
       const res = await fetch(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" + key,
         { method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } } }) }
       );
-      if (res.status === 429) continue;
-      if (!res.ok) break;
+      if (res.status === 429) { if (attempt === 2) throw new Error("Gemini 429: しばらく待ってから試してください"); continue; }
+      if (!res.ok) { const d = await res.json(); throw new Error("Gemini " + res.status + ": " + (d.error?.message ?? "")); }
+      recordGeminiRequest().catch(() => {});
       const d = await res.json();
       return d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
     }
-    return ""; // fallthrough
+    return "";
   }
   if (model === "openai") {
     const key = apiKey || process.env.EXPO_PUBLIC_OPENAI_API_KEY || "";
@@ -601,24 +623,11 @@ async function callWithModel(
       body: JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: prompt }], max_tokens: maxTokens }),
     });
     const d = await res.json();
+    if (!res.ok) throw new Error("OpenAI " + res.status + ": " + (d.error?.message ?? ""));
     return d.choices?.[0]?.message?.content?.trim() ?? "";
   }
-  // claude
-  // claude: callClaudeを使うがトークン記録はcallClaude内では不可
-  // pseudoStreamと別経路なので個別に計上
-  const msgs = [{ role: "user", content: prompt }];
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-api-key": apiKey || process.env.EXPO_PUBLIC_ANTHROPIC_API_KEY || "", "anthropic-version": "2023-06-01", "anthropic-dangerous-request-allowed": "true" },
-    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: maxTokens, messages: msgs }),
-  });
-  const d = await res.json();
-  if (!res.ok) throw new Error(d.error?.message ?? "Claude error");
-  if (d.usage) recordTokenUsage("claude", d.usage.input_tokens ?? 0, d.usage.output_tokens ?? 0).catch(() => {});
-  return d.content?.[0]?.text?.trim() ?? "";
+  return await callClaude([{ role: "user", content: prompt }], maxTokens);
 }
-
-// タブをまたいで生成を継続するためのモジュールレベルの状態
 let _globalChatActive = false;
 // モジュールレベルでrunBlockを実行するためのコールバック群
 // unmount後もsetChatMessagesをAsyncStorage経由で保存し続ける
@@ -643,7 +652,7 @@ async function runBlockGlobal(
 
     const history = accumulated
       .filter((m) => m.role !== "topic")
-      .slice(-6)
+      .slice(-4)
       .map((m) => (m.role === "you" ? "あなたAI" : persona.label) + ": " + m.text)
       .join(" / ");
 
@@ -725,6 +734,8 @@ async function callAI(
   model: string, apiKey: string, maxTokens = 500
 ): Promise<string> {
   if (model === "gemini") {
+    // callAIはGeminiのレート制限節約のためClaudeを使用
+    return await callClaude(messages, maxTokens);
     const key = apiKey || process.env.EXPO_PUBLIC_GEMINI_API_KEY || "";
     const contents = messages.map((m) => ({
       role: m.role === "assistant" ? "model" : "user",
@@ -1075,13 +1086,16 @@ function UsageDisplay({ stats, model }: {
     const used = stats.gemini.minuteRequests;
     const FREE_LIMIT = 15;
     // スライディングウィンドウ: 最古のリクエストから60秒後にリセット
-    const timestamps = (stats.gemini as any).timestamps ?? [];
-    const oldest = timestamps.length > 0 ? timestamps[0] : now;
-    const resetIn = Math.max(0, Math.ceil((oldest + 60000 - now) / 1000));
+    const timestamps = (stats.gemini as any).timestamps as number[] ?? [];
+    // 過去60秒以内のタイムスタンプだけカウント
+    const validTs = timestamps.filter((t) => now - t < 60000);
+    const actualUsed = validTs.length;
+    const firstRequest = validTs.length > 0 ? validTs[0] : 0;
+    const resetIn = firstRequest > 0 ? Math.max(0, Math.ceil((firstRequest + 60000 - now) / 1000)) : 0;
     return (
       <View style={usageStyles.wrap}>
-        <Text style={usageStyles.row}>{used + "/" + FREE_LIMIT}</Text>
-        <Text style={usageStyles.sub}>{used > 0 ? "残" + resetIn + "s" : "利用可"}</Text>
+        <Text style={usageStyles.row}>{actualUsed + "/" + FREE_LIMIT}</Text>
+        <Text style={usageStyles.sub}>{resetIn > 0 ? "残" + resetIn + "s" : "利用可"}</Text>
       </View>
     );
   }
@@ -1388,7 +1402,7 @@ export default function AIScreen() {
       });
     };
     refresh();
-    const t = setInterval(refresh, 2000);
+    const t = setInterval(refresh, 500);
     return () => clearInterval(t);
   }, []);
 
@@ -1418,12 +1432,7 @@ export default function AIScreen() {
     if (analyses.length > 0) AsyncStorage.setItem(ANALYSIS_KEY, JSON.stringify(analyses));
   }, [analyses]);
 
-  // ── 初回生成 ──
-  useEffect(() => {
-    const done = feedCards.filter((c) => !c.loading);
-    const age  = done.slice(-1)[0] ? Date.now() - done.slice(-1)[0].createdAt : Infinity;
-    if (age > 10 * 60 * 1000 || done.length < 3) addCard();
-  }, [entries, myList]);
+  // 自動生成は無効化（ボタン押下のみ）
 
   // ── 位置情報・時間帯を個人コンテキストとして取得 ──
   useEffect(() => {
@@ -1527,7 +1536,7 @@ export default function AIScreen() {
   const handleSkip = useCallback((cardId: string) => {
     // スキップしたカードを削除して新しいカードを追加
     setFeedCards((prev) => prev.filter((c) => c.id !== cardId));
-    addCard();
+    // 自動生成なし
   }, [addCard]);
 
   // ── 分析実行 ──
@@ -1582,7 +1591,7 @@ export default function AIScreen() {
 
       const history = accumulated
         .filter((m) => m.role !== "topic")
-        .slice(-6)
+        .slice(-4)
         .map((m) => (m.role === "you" ? "あなたAI" : persona.label) + ": " + m.text)
         .join(" / ");
 
@@ -1787,14 +1796,13 @@ export default function AIScreen() {
           const key = apiKeyRef.current;
           if (!key) throw new Error("GeminiのAPIキーが未設定です");
           for (let attempt = 0; attempt < 3; attempt++) {
-            if (attempt > 0) await new Promise((r2) => setTimeout(r2, 5000));
+            if (attempt > 0) await new Promise((r2) => setTimeout(r2, 3000));
             const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" + key,
-              { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 80 } }) });
-            if (r.status === 429) {
-              if (attempt === 2) throw new Error("Gemini 429: レート制限。しばらく待ってから試してください");
-              continue;
-            }
-            if (!r.ok) { const d = await r.json(); throw new Error("Gemini " + r.status + ": " + (d.error?.message ?? "エラー")); }
+              { method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 80, thinkingConfig: { thinkingBudget: 0 } } }) });
+            if (r.status === 429) { if (attempt === 2) throw new Error("Gemini 429: しばらく待ってから試してください"); continue; }
+            if (!r.ok) { const d = await r.json(); throw new Error("Gemini " + r.status); }
+            recordGeminiRequest().catch(() => {});
             const d = await r.json();
             return d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
           }
