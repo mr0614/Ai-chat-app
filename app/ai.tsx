@@ -169,6 +169,22 @@ class ChatEngine {
         }
       }
 
+      if (model === "groq") {
+        const key = apiKeys.groq || "";
+        console.log("[Groq] key length:", key.length);
+        if (!key) throw new Error("GroqのAPIキーが未設定です\nconsole.groq.comで無料取得できます");
+        const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
+          body: JSON.stringify({ model: "llama-3.3-70b-versatile", messages: [{ role: "user", content: prompt }], max_tokens: maxTokens }),
+        });
+        const d = await res.json();
+        console.log("[Groq] status:", res.status);
+        if (!res.ok) throw new Error("Groq " + res.status + ": " + (d.error?.message ?? ""));
+        return d.choices?.[0]?.message?.content?.trim() ?? "";
+      }
+
+
       // Claude
       const key = apiKeys.claude || process.env.EXPO_PUBLIC_ANTHROPIC_API_KEY || "";
       const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -403,6 +419,7 @@ const MODEL_KEY        = "ai_model_setting";
 const APIKEY_CLAUDE    = "ai_apikey_claude";
 const APIKEY_GEMINI    = "ai_apikey_gemini";
 const APIKEY_OPENAI    = "ai_apikey_openai";
+const APIKEY_GROQ      = "ai_apikey_groq";
 const CHAT_HISTORY_KEY    = "ai_chat_history_v1";
 const CHAT_SESSION_KEY    = "ai_chat_session_v1"; // 進行中の会話を保存
 
@@ -496,6 +513,17 @@ async function pseudoStream(
     const d = await res.json();
     full = d.choices?.[0]?.message?.content?.trim() ?? "";
     if (d.usage) recordTokenUsage("openai", d.usage.prompt_tokens ?? 0, d.usage.completion_tokens ?? 0).catch(() => {});
+  } else if (model === "groq") {
+    const key = apiKey || "";
+    if (!key) throw new Error("GroqのAPIキーが未設定です");
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
+      body: JSON.stringify({ model: "llama-3.3-70b-versatile", messages: [{ role: "user", content: prompt }], max_tokens: maxTokens }),
+    });
+    if (!res.ok) { const d = await res.json(); throw new Error("Groq " + res.status + ": " + (d.error?.message ?? "")); }
+    const d = await res.json();
+    full = d.choices?.[0]?.message?.content?.trim() ?? "";
   } else {
     // Claude
     const key = apiKey || process.env.EXPO_PUBLIC_ANTHROPIC_API_KEY || "";
@@ -624,6 +652,18 @@ async function callWithModel(
     });
     const d = await res.json();
     if (!res.ok) throw new Error("OpenAI " + res.status + ": " + (d.error?.message ?? ""));
+    return d.choices?.[0]?.message?.content?.trim() ?? "";
+  }
+  if (model === "groq") {
+    const key = apiKey || "";
+    if (!key) throw new Error("GroqのAPIキーが未設定です\nconsole.groq.comで無料取得できます");
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
+      body: JSON.stringify({ model: "llama-3.3-70b-versatile", messages: [{ role: "user", content: prompt }], max_tokens: maxTokens }),
+    });
+    const d = await res.json();
+    if (!res.ok) throw new Error("Groq " + res.status + ": " + (d.error?.message ?? ""));
     return d.choices?.[0]?.message?.content?.trim() ?? "";
   }
   return await callClaude([{ role: "user", content: prompt }], maxTokens);
@@ -1084,7 +1124,7 @@ function UsageDisplay({ stats, model }: {
 
   if (model === "gemini") {
     const used = stats.gemini.minuteRequests;
-    const FREE_LIMIT = 15;
+    const FREE_LIMIT = 20;
     // スライディングウィンドウ: 最古のリクエストから60秒後にリセット
     const timestamps = (stats.gemini as any).timestamps as number[] ?? [];
     // 過去60秒以内のタイムスタンプだけカウント
@@ -1100,6 +1140,14 @@ function UsageDisplay({ stats, model }: {
     );
   }
 
+  if (model === "groq") {
+    return (
+      <View style={usageStyles.wrap}>
+        <Text style={usageStyles.row}>Groq</Text>
+        <Text style={usageStyles.sub}>無料</Text>
+      </View>
+    );
+  }
   const data = model === "openai" ? stats.openai : stats.claude;
   const tok = data.inputTokens + data.outputTokens;
   return (
@@ -1297,7 +1345,8 @@ export default function AIScreen() {
   } | null>(null);
   // この会話セッションのトークン数（mount時にリセット）
   const sessionTokensRef = React.useRef({ inputTokens: 0, outputTokens: 0 });
-  const chatScrollRef = React.useRef<ScrollView>(null);
+  const chatScrollRef       = React.useRef<ScrollView>(null);
+  const isUserScrollingRef   = React.useRef(false);
   const chatToneRef = React.useRef<ToneId>("normal");
   React.useEffect(() => { chatToneRef.current = chatTone; }, [chatTone]);
   const [topicGenerating, setTopicGenerating] = useState(false);
@@ -1305,11 +1354,11 @@ export default function AIScreen() {
   const aiModelRef     = React.useRef(aiModel);
   const chatPersonaRef = React.useRef(chatPersona);
   const abortRef       = React.useRef(false);
-  const apiKeysRef     = React.useRef<Record<string,string>>({ claude: '', gemini: '', openai: '' });
+  const apiKeysRef     = React.useRef<Record<string,string>>({ claude: '', gemini: '', openai: '', groq: '' });
   const chatTopicRef   = React.useRef(chatTopic);
   // apiKeyRefは常に現在のモデルに対応するキーを動的に返す
   const apiKeyRef = React.useMemo(() => ({
-    get current() { return apiKeysRef.current[aiModelRef.current as 'claude'|'gemini'|'openai'] ?? ''; },
+    get current() { return apiKeysRef.current[aiModelRef.current as 'claude'|'gemini'|'openai'|'groq'] ?? ''; },
     set current(_: string) {},
   }), []);
   React.useEffect(() => { aiModelRef.current     = aiModel;     }, [aiModel]);
@@ -1330,8 +1379,9 @@ export default function AIScreen() {
       AsyncStorage.getItem(APIKEY_CLAUDE),
       AsyncStorage.getItem(APIKEY_GEMINI),
       AsyncStorage.getItem(APIKEY_OPENAI),
+      AsyncStorage.getItem(APIKEY_GROQ),
       AsyncStorage.getItem("user_ai_persona"),
-    ]).then(([e, m, f, a, an, pc, ch, mod, kCl, kGe, kOp, persona]) => {
+    ]).then(([e, m, f, a, an, pc, ch, mod, kCl, kGe, kOp, kGr, persona]) => {
       if (e)   try { setEntries(JSON.parse(e));      } catch {}
       if (m)   try { setMyList(JSON.parse(m));        } catch {}
       if (f)   try { setFeedCards(JSON.parse(f));     } catch {}
@@ -1340,7 +1390,7 @@ export default function AIScreen() {
       if (pc)  setPersonalContext(pc);
       if (ch)  try { setChatHistory(JSON.parse(ch));  } catch {}
       if (mod) setAiModel(mod);
-      apiKeysRef.current = { claude: kCl ?? "", gemini: kGe ?? "", openai: kOp ?? "" };
+      apiKeysRef.current = { claude: kCl ?? "", gemini: kGe ?? "", openai: kOp ?? "", groq: kGr ?? "" };
       if (persona) setUserAiPersona(persona);
     });
     // chatEngineの変化を購読
@@ -1670,7 +1720,7 @@ export default function AIScreen() {
     const curModel  = aiModelRef.current;
     const curKeys   = { ...apiKeysRef.current };
 
-    console.log("[startChat] model:", curModel, "keys:", { claude: curKeys.claude?.length, gemini: curKeys.gemini?.length, openai: curKeys.openai?.length });
+    console.log("[startChat] model:", curModel, "keys:", { claude: curKeys.claude?.length, gemini: curKeys.gemini?.length, openai: curKeys.openai?.length, groq: curKeys.groq?.length });
     await chatEngine.setState({
       messages: [topicMsg], topic, started: true, paused: false,
       loading: true, turnCount: 0, sessionId: sid,
@@ -1702,7 +1752,7 @@ export default function AIScreen() {
         return [...prev, { ...msg, streaming: false }];
       });
     };
-    chatEngine.runTurns(curModel, curKeys, personaPr, TURNS_PER_BLOCK, updateMsg)
+    chatEngine.runTurns(curModel, curKeys, personaPr, TURNS_PER_BLOCK, updateMsg, buildUserContext(), userAiPersona)
     .then(async () => {
       const s = await chatEngine.getState();
       const clean = s.messages.map((m: any) => ({ ...m, streaming: false }));
@@ -1755,7 +1805,7 @@ export default function AIScreen() {
         return [...prev, { ...msg, streaming: false }];
       });
     };
-    chatEngine.runTurns(curModel, curKeys, personaPr, TURNS_PER_BLOCK, updateMsg2)
+    chatEngine.runTurns(curModel, curKeys, personaPr, TURNS_PER_BLOCK, updateMsg2, buildUserContext(), userAiPersona)
     .then(async () => {
       const s = await chatEngine.getState();
       const clean = s.messages.map((m: any) => ({ ...m, streaming: false }));
@@ -1780,16 +1830,21 @@ export default function AIScreen() {
     if (topicGenerating) return;
     setTopicGenerating(true);
     const userCtx = buildUserContext();
-    const listSample = myList.filter((m) => m.category !== "music").map((m) => m.title).slice(0, 5).join("、");
-    const musicSample = myList.filter((m) => m.category === "music").slice(0, 3).map((m) => m.title).join("、");
-    const entrySample = entries.filter((e) => !e.aiSuggested).slice(0, 3).map((e) => e.text).join("、");
-    const types = ["もし〜だったら？形式","〜と〜どちらが好き？形式","なぜ〜が好きなの？形式","〜についてどう思う？形式","〜の場面で自分はどうする？形式"];
+    // MyWorldデータからランダムに1〜2件だけ選ぶ（偏り防止）
+    const allTitles = myList.filter((m) => m.category !== "music").map((m) => m.title);
+    const shuffled = allTitles.sort(() => Math.random() - 0.5);
+    const listSample = shuffled.slice(0, 2).join("、"); // 最大2件
+    const musicSample = myList.filter((m) => m.category === "music")
+      .sort(() => Math.random() - 0.5).slice(0, 1).map((m) => m.title).join("、"); // 最大1件
+    const entrySample = entries.filter((e) => !e.aiSuggested)
+      .sort(() => Math.random() - 0.5).slice(0, 2).map((e) => e.text).join("、");
+    const types = ["もし〜だったら？形式","〜と〜どちらが好き？形式","なぜ〜が好きなの？形式","〜についてどう思う？形式","〜の場面で自分はどうする？形式","仮定の状況形式","価値観を問う形式","逆説的な問い形式"];
     const chosenType = types[Math.floor(Math.random() * types.length)];
-    const prompt = "ユーザーの情報をもとにAI同士の会話トピックを1つ生成。" +
-      (listSample ? "好きな作品: " + listSample + "。" : "") +
-      (musicSample ? "音楽: " + musicSample + "。" : "") +
+    const prompt = "ユーザーの情報をもとにAI同士の会話トピックを1つ生成。毎回違うテーマにする。" +
+      (listSample ? "参考（使わなくてもよい）: " + listSample + "。" : "") +
+      (musicSample ? "音楽参考: " + musicSample + "。" : "") +
       (entrySample ? "自己紹介: " + entrySample + "。" : "") +
-      "形式: " + chosenType + "。具体的な作品名・状況を含む。25字以内。トピック文のみ:";
+      "形式: " + chosenType + "。具体的・ユニーク。25字以内。トピック文のみ:";
     try {
       const res2 = await (async () => {
         if (aiModelRef.current === "gemini") {
@@ -1812,13 +1867,23 @@ export default function AIScreen() {
           const r = await fetch("https://api.openai.com/v1/chat/completions",
             { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + key }, body: JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: prompt }], max_tokens: 80 }) });
           const d = await r.json(); return d.choices?.[0]?.message?.content?.trim() ?? "";
+        } else if (aiModelRef.current === "groq") {
+          const key = apiKeyRef.current;
+          if (!key) throw new Error("GroqのAPIキーが未設定です");
+          const r = await fetch("https://api.groq.com/openai/v1/chat/completions",
+            { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
+              body: JSON.stringify({ model: "llama-3.3-70b-versatile", messages: [{ role: "user", content: prompt }], max_tokens: 80 }) });
+          const d = await r.json();
+          if (!r.ok) throw new Error("Groq " + r.status);
+          return d.choices?.[0]?.message?.content?.trim() ?? "";
         } else {
           return await callClaude([{ role: "user", content: prompt }], 80);
         }
       })();
       if (res2) setChatTopic(res2.replace(/^「|」$/g, "").trim());
     } catch (e: any) {
-      setChatTopic("エラー: " + (e?.message ?? String(e)));
+      // エラーはtopicにセットせずアラートで表示
+      alert("話題生成エラー: " + (e?.message ?? String(e)));
     } finally {
       setTopicGenerating(false);
     }
@@ -1829,7 +1894,7 @@ export default function AIScreen() {
     chatEngine.abort();
     setChatLoading(false);
     setChatPaused(true);
-    setShowChatHistory(true);
+    // 履歴windowは開かない
   };
 
   // ── リセット（新規開始）──
@@ -1940,7 +2005,18 @@ export default function AIScreen() {
             </View>
           )}
 
-          <ScrollView ref={chatScrollRef} style={{ flex: 1 }} contentContainerStyle={styles.chatLog} onContentSizeChange={() => chatScrollRef.current?.scrollToEnd({ animated: true })}>
+          <ScrollView
+            ref={chatScrollRef}
+            style={{ flex: 1 }}
+            contentContainerStyle={styles.chatLog}
+            onScrollBeginDrag={() => { isUserScrollingRef.current = true; }}
+            onMomentumScrollEnd={() => { isUserScrollingRef.current = false; }}
+            onContentSizeChange={() => {
+              if (!isUserScrollingRef.current) {
+                chatScrollRef.current?.scrollToEnd({ animated: true });
+              }
+            }}
+          >
             {!chatStarted && (
               <View style={styles.chatEmpty}>
                 <Text style={styles.chatEmptyText}>{`AIどうしが会話します\n${TURNS_PER_BLOCK}ターンごとに確認します`}</Text>

@@ -93,6 +93,8 @@ class ChatEngine {
     personaPrompt: string,
     turns: number,
     onMessage: (msg: EngineMessage) => void,
+    userContext: string = "",
+    userPersona: string = "",
   ): Promise<void> {
     if (this.running) return;
     this.running = true;
@@ -135,7 +137,13 @@ class ChatEngine {
             // 成功・失敗に関わらずステータスコードをログ出力
 
             if (res.status === 429 || res.status === 503) {
-              const waitSec = res.status === 503 ? 10 : 30;
+              let waitSec = res.status === 503 ? 10 : 35;
+              try {
+                const errJson = await res.clone().json();
+                const errMsg = errJson?.error?.message ?? "";
+                const m = errMsg.match(/retry in ([0-9.]+)s/i);
+                if (m) waitSec = Math.ceil(parseFloat(m[1])) + 3;
+              } catch {}
               await this.setState({ waitingMsg: (res.status === 429 ? "Gemini 429" : "Gemini 503") + ": " + waitSec + "秒待機中..." });
               await new Promise((r) => setTimeout(r, waitSec * 1000));
               await this.setState({ waitingMsg: "" });
@@ -207,6 +215,20 @@ class ChatEngine {
         return d.choices?.[0]?.message?.content?.trim() ?? "";
       }
 
+      if (model === "groq") {
+        const key = apiKeys.groq || "";
+        if (!key) throw new Error("GroqのAPIキーが未設定です\nconsole.groq.comで無料取得できます");
+        const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
+          body: JSON.stringify({ model: "llama-3.3-70b-versatile", messages: [{ role: "user", content: prompt }], max_tokens: maxTokens }),
+        });
+        const d = await res.json();
+        if (!res.ok) throw new Error("Groq " + res.status + ": " + (d.error?.message ?? ""));
+        return d.choices?.[0]?.message?.content?.trim() ?? "";
+      }
+
+
       // Claude
       {
         const key =
@@ -266,13 +288,17 @@ class ChatEngine {
           currentState.topic ||
           msgs.find((m) => m.role === "topic")?.text ||
           "";
+        // あなたAIの口調：設定 > index/myworldデータから推定 の優先順位
+        const youPersonaBase = userPersona
+          ? "あなたは以下の設定のキャラクターです: " + userPersona + " "
+          : userContext
+          ? "あなたはこのユーザーです。" + userContext + " このユーザーになりきって自然に話してください。"
+          : "あなたは自然な口語で話す人物です。";
         const youPrompt =
-          "あなたは自然な口語で話す人物です。" +
-          " 【議題】" +
-          topicText +
-          " 【会話履歴】" +
-          history +
-          " 1〜2文で自分の視点を返す。「じゃん」「だよね」「かな」などの口語で。分析・箇条書き禁止。";
+          youPersonaBase +
+          " 【話し方】相手AIとは別人。自分の感覚・経験から短く返す。口語で1〜2文。分析・箇条書き禁止。" +
+          " 【議題】" + topicText +
+          " 【会話履歴】" + history;
 
         const youPlaceholder: EngineMessage = {
           role: "you",

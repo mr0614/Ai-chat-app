@@ -23,6 +23,7 @@ const MODEL_KEY         = "ai_model_setting";
 const APIKEY_CLAUDE      = "ai_apikey_claude";
 const APIKEY_GEMINI      = "ai_apikey_gemini";
 const APIKEY_OPENAI      = "ai_apikey_openai";
+const APIKEY_GROQ        = "ai_apikey_groq";
 const USAGE_KEY          = "ai_usage_stats";
 
 // 将来の連携サービス（現在は未実装）
@@ -38,7 +39,7 @@ export default function SettingsScreen() {
   const [spotifyLoading,  setSpotifyLoading]  = useState(false);
   const [aiPersonaText,   setAiPersonaText]   = useState("");   // あなたAIキャラ設定
   const [aiModel,     setAiModel]     = useState("claude");
-  const [apiKeys,     setApiKeys]     = useState<Record<string,string>>({ claude: "", gemini: "", openai: "" });
+  const [apiKeys,     setApiKeys]     = useState<Record<string,string>>({ claude: "", gemini: "", openai: "", groq: "" });
   const [showApiKey,  setShowApiKey]  = useState(false);
   const [usage, setUsage] = useState<{
     gemini: { minuteRequests: number; minuteStart: number; totalRequests: number };
@@ -55,8 +56,9 @@ export default function SettingsScreen() {
       AsyncStorage.getItem(APIKEY_CLAUDE),
       AsyncStorage.getItem(APIKEY_GEMINI),
       AsyncStorage.getItem(APIKEY_OPENAI),
-    ]).then(([cl, ge, op]) => {
-      setApiKeys({ claude: cl ?? "", gemini: ge ?? "", openai: op ?? "" });
+      AsyncStorage.getItem(APIKEY_GROQ),
+    ]).then(([cl, ge, op, gr]) => {
+      setApiKeys({ claude: cl ?? "", gemini: ge ?? "", openai: op ?? "", groq: gr ?? "" });
     });
   }, []);
 
@@ -165,7 +167,7 @@ export default function SettingsScreen() {
           keyHint: "console.anthropic.comでキーを取得（有料）",
         },
         {
-          id: "gemini", label: "Gemini 2.5 Flash", sub: "無料枠あり・高速",
+          id: "gemini", label: "Gemini 2.0 Flash", sub: "無料枠あり・高速",
           keyUrl: "https://aistudio.google.com/apikey",
           keyHint: "aistudio.google.comで無料取得",
         },
@@ -173,6 +175,11 @@ export default function SettingsScreen() {
           id: "openai", label: "GPT-4o-mini", sub: "低コスト",
           keyUrl: "https://platform.openai.com/api-keys",
           keyHint: "platform.openai.comでキーを取得（有料）",
+        },
+        {
+          id: "groq", label: "Groq (Llama 70B)", sub: "無料1日14,400リクエスト",
+          keyUrl: "https://console.groq.com/keys",
+          keyHint: "console.groq.comで無料取得",
         },
       ] as const).map((m) => (
         <View key={m.id}>
@@ -200,7 +207,7 @@ export default function SettingsScreen() {
                   onChangeText={(v) => {
                     const next = { ...apiKeys, [m.id]: v };
                     setApiKeys(next);
-                    const key = m.id === "claude" ? APIKEY_CLAUDE : m.id === "gemini" ? APIKEY_GEMINI : APIKEY_OPENAI;
+                    const key = m.id === "claude" ? APIKEY_CLAUDE : m.id === "gemini" ? APIKEY_GEMINI : m.id === "groq" ? APIKEY_GROQ : APIKEY_OPENAI;
                     AsyncStorage.setItem(key, v);
                   }}
                   secureTextEntry={!showApiKey}
@@ -252,6 +259,12 @@ export default function SettingsScreen() {
                   <Text style={stylesSet.usageSubText}>
                     {"累計コスト: $" + (usage[m.id as "claude"|"openai"].cost).toFixed(4)}
                   </Text>
+                </View>
+              )}
+              {usage && m.id === "groq" && (
+                <View style={stylesSet.usageBox}>
+                  <Text style={stylesSet.usageText}>完全無料（1日14,400リクエスト）</Text>
+                  <Text style={stylesSet.usageSubText}>console.groq.comで取得</Text>
                 </View>
               )}
             </View>
