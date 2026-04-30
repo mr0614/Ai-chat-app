@@ -97,6 +97,8 @@ class ChatEngine {
     personaPrompt: string,
     turns: number,
     onMessage: (msg: EngineMessage) => void,
+    userContext: string = "",
+    userPersona: string = "",
   ): Promise<void> {
     this.running  = true;
     this.aborted  = false;
@@ -200,6 +202,7 @@ class ChatEngine {
 
     // topicはstateから1回だけ取得
     const initState = await this.getState();
+    console.log('[ENGINE] userPersona:', userPersona?.slice(0,50), 'ctx:', userContext?.slice(0,60));
     const topicText = initState.topic || initState.messages?.find((m: any) => m.role === "topic")?.text || "";
     console.log("[ChatEngine] topic:", topicText, "msgs:", initState.messages?.length);
 
@@ -229,17 +232,29 @@ class ChatEngine {
         const variation = variations[Math.floor(Math.random() * variations.length)];
 
         // ── あなたAI ──
+        const youCharaDef = userPersona
+          ? "あなたは以下の設定のキャラクターです: " + userPersona
+          : userContext
+          ? "以下のデータから最も突出した傾向だけを抽出して尖ったキャラを作れ。平均化禁止。" +
+            "データ：" + userContext
+          : "自然な口語で話す人物";
         const youPrompt =
-          "あなたは自然な口語で話す人物です。" +
+          youCharaDef +
+          " 【必須：毎ターン以下を全て含める】" +
+          "①議題のキーワードを**太字**で1つ明示する " +
+          "②そのキーワードに関するトリビア・豆知識・裏話・制作秘話を1つ出す " +
+          "③比喩かユーモアを1つ使う（例えると〜） " +
+          "④なぜそうなるかの理由を説明する " +
+          "⑤前の発言を受けて新しい切り口で発展させる（言い換え・同意だけ禁止） " +
+          " 【禁止】他作品の無理な引用・浅い感想・箇条書き・長文分析 " +
+          " 【文体】口語。100〜150文字程度。 " +
           " 【議題】" + topicText +
-          " 【会話履歴】" + history +
-          " 1〜2文で自分の視点を返す。「じゃん」「だよね」「かな」などの口語で。分析・箇条書き禁止。";
-
+          " 【会話履歴】" + history;
         const youPlaceholder: EngineMessage = { role: "you", text: "", streaming: true };
         msgs = [...msgs, youPlaceholder];
         onMessage(youPlaceholder);
 
-        const youFull = await callModel(youPrompt, 150);
+        const youFull = await callModel(youPrompt, 350);
         if (this.aborted) break;
 
         // 疑似ストリーミング（文字を1文字ずつ送る）
@@ -259,16 +274,21 @@ class ChatEngine {
 
         // ── 相手AI ──
         const otherPrompt = personaPrompt +
-          " 話し方: 自然な口語。毎回違う切り口。同じ言い回しを繰り返さない。" +
+          " 【必須：毎ターン以下を全て含める】" +
+          "①議題のキーワードを**太字**で1つ明示する " +
+          "②そのキーワードに関するトリビア・豆知識・裏話・制作秘話を1つ出す " +
+          "③比喩かユーモアを1つ使う（例えるなら〜） " +
+          "④なぜそうなるかの理由を説明する " +
+          "⑤前の発言を受けて新しい切り口で発展させる（言い換え・同意だけ禁止） " +
+          " 【禁止】他作品の無理な引用・浅い感想・長文分析 " +
+          " 【文体】口調・性格を必ず守る。100〜150文字程度。 " +
           " 【議題】" + topicText +
-          " 【会話履歴】" + history + " / あなたAI: " + youFull +
-          " " + variation + " 1〜2文。";
-
+          " 【会話履歴】" + history + " / あなたAI: " + youFull;
         const otherPlaceholder: EngineMessage = { role: "other", text: "", streaming: true };
         msgs = [...msgs, otherPlaceholder];
         onMessage(otherPlaceholder);
 
-        const otherFull = await callModel(otherPrompt, 150);
+        const otherFull = await callModel(otherPrompt, 350);
         if (this.aborted) break;
 
         let otherStreamed = "";
@@ -383,36 +403,51 @@ interface AnalysisRecord { id: string; text: string; summary: string; createdAt:
 interface ChatMessage { role: "you" | "other" | "topic"; text: string; streaming?: boolean; }
 interface ChatSession { id: string; topic: string; messages: ChatMessage[]; personaId: string; createdAt: number; }
 
-const AI_ROLES = [
-  { id: "contrarian",  label: "反論者",       base: "相手の意見に必ず別の角度から切り込む。同意はしない。" },
-  { id: "philosopher", label: "哲学者",       base: "物事の根本・本質を問い続ける。「なぜ」を繰り返す。" },
-  { id: "empath",      label: "共感型",       base: "相手の感情・体験に寄り添い内面を引き出す。" },
-  { id: "analyst",     label: "分析家",       base: "感情を排し論理・構造で物事を分析する。" },
-  { id: "wild",        label: "ランダム",     base: "予測不能で突拍子もない角度から切り込む。" },
-  { id: "neutral",     label: "ニュートラル", base: "判断・感情を持たずフラットに整理・深掘りする。" },
+// ─── 相手AIの口調スタイル ────────────────────────────────
+const AI_STYLES = [
+  {
+    id: "obasan",
+    label: "おばさん",
+    prompt: `おばさん構文で話す。
+【話し方】
+・文頭はランダムに「あら／あらら〜／あらまぁ／まぁねぇ／そうねぇ／あのねぇ／ちょっとねぇ」から選ぶ
+・語尾は「〜よ／〜だわ／〜よん／〜かしら／〜なのよ／〜なのよねぇ」
+・「しぃ」はポジティブ限定で1回まで（楽しぃ／嬉しぃ）
+・「〜」を1文1回以上多用
+・「...」を適度に使う
+・あ行小文字（わぁ／だょ／ねぇ）を1回以上使う
+・文章は長め（3〜4文）。1〜2文で終わらせない
+・軽いお母さん目線・世間話感覚を含める
+・裏話や豆知識があれば「そういえばねぇ〜」「知ってる？」と自然につなげる
+
+【内容】説明禁止。感情・体験・記憶ベースで話す。余韻（「ほんとに…」「もう〜」）を入れる。他の作品や体験と絡めた話も歓迎。
+【絵文字】文中・文末に分散。感情や単語に一致する絵文字を優先。単体/3連/2同1異を2:7:1の比率で。❗️は最大2連まで。驚きは顔絵文字で表現（😳😲😮😧😨😱😵‍💫🤯）。ハートは複数バリエーション（❤️💖💗💓💕💞💘💝）。同じ絵文字セット連続禁止。説明文のみNG。`,
+  },
+  {
+    id: "nanj",
+    label: "なんJ民",
+    prompt: `なんJ民の口調で話す。
+【話し方】語尾は「〜やろ／〜やん／〜ンゴ／〜定期／〜草」を使う。文頭は「はぁ？／せやな／ほんまそれ／ワイ的には／草生える」などランダムに。ツッコミ・煽り・共感が混在する。カタカナ多め。横断的な知識をひけらかす。「w」「草」を笑いに使う。長文は避けて短くテンポよく。絵文字は基本使わないが「草」「ンゴ」「定期」はOK。`,
+  },
+  {
+    id: "gyaru",
+    label: "ギャル",
+    prompt: `ギャル口調で話す。
+【話し方】「〜じゃん／〜だし／〜くね？／〜みたいな／〜てか」を語尾に使う。文頭は「えー！／マジ？／てかさー／やばくね？／うける」など。感情表現が豊か。「ヤバい」「マジ」「超」「激」を多用。テンション高め。友達感覚で距離感ゼロ。絵文字は多め（💅🔥✨😂💦🙏）でテンション重視。説明より感情リアクションを優先。`,
+  },
 ] as const;
 
-const AI_TONES = [
-  { id: "normal",   label: "普通",       tone: "" },
-  { id: "stubborn", label: "頑固",       tone: "話し方は頑固で絶対に引かない。自分の意見を押し通す口調。" },
-  { id: "light",    label: "軽い",       tone: "話し方はかなり軽くてカジュアル。敬語なし、友達感覚。「じゃん」「だよね」「まじで」を多用。" },
-  { id: "dumb",     label: "おバカ",     tone: "話し方はちょっとおバカ。難しいことは苦手で単純な言葉を使う。たまに的外れなことを言う。" },
-  { id: "annoying", label: "うざい",     tone: "話し方はうざい。過剰に絡んでくる、くどい、しつこい、テンション高め。" },
-  { id: "cool",     label: "クール",     tone: "話し方はクールで無駄がない。感情を出さず短く返す。" },
-  { id: "cheerful", label: "明るい",     tone: "話し方は超明るくポジティブ。感嘆符多め、テンション高め。" },
-] as const;
+type StyleId = typeof AI_STYLES[number]["id"];
+type RoleId = StyleId; // 後方互換
+type ToneId = "normal"; // 後方互換（未使用）
+type PersonaId = StyleId;
+const AI_ROLES = AI_STYLES; // 後方互換
+const AI_TONES = [{ id: "normal", label: "普通", tone: "" }] as const;
+const AI_PERSONAS = AI_STYLES.map((s) => ({ ...s, base: s.prompt, desc: s.prompt }));
 
-type RoleId = typeof AI_ROLES[number]["id"];
-type ToneId = typeof AI_TONES[number]["id"];
-
-// 後方互換のため PersonaId は RoleId として扱う
-type PersonaId = RoleId;
-const AI_PERSONAS = AI_ROLES.map((r) => ({ ...r, desc: r.base, prompt: r.base }));
-
-function buildPersonaPrompt(roleId: RoleId, toneId: ToneId): string {
-  const role = AI_ROLES.find((r) => r.id === roleId) ?? AI_ROLES[0];
-  const tone = AI_TONES.find((t) => t.id === toneId) ?? AI_TONES[0];
-  return role.base + (tone.tone ? " " + tone.tone : "");
+function buildPersonaPrompt(styleId: StyleId, _toneId?: string): string {
+  const style = AI_STYLES.find((s) => s.id === styleId) ?? AI_STYLES[0];
+  return style.prompt;
 }
 
 const MODEL_KEY        = "ai_model_setting";
@@ -1189,51 +1224,36 @@ function AnimatedActionButton({ label, onPress, disabled, loading }: {
 }
 
 // ─── ペルソナグリッド（ドラッグ選択対応）────────────────────
-function PersonaGrid({ chatPersona, chatTone, onSelect }: {
-  chatPersona: RoleId; chatTone: ToneId;
-  onSelect: (role: RoleId, tone: ToneId) => void;
+function PersonaGrid({ chatPersona, onSelect }: {
+  chatPersona: StyleId;
+  onSelect: (style: StyleId) => void;
 }) {
-  const [tempRole, setTempRole] = useState<RoleId>(chatPersona);
-  const [tempTone, setTempTone] = useState<ToneId>(chatTone);
+  const [tempStyle, setTempStyle] = useState<StyleId>(chatPersona);
 
   return (
     <View style={styles.personaPickerWrap}>
-      <Text style={styles.personaPickerSection}>役割</Text>
-      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6, paddingHorizontal: 12, marginBottom: 10 }}>
-        {AI_ROLES.map((r) => (
+      <Text style={styles.personaPickerSection}>相手AIの口調</Text>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, paddingHorizontal: 12, marginBottom: 10 }}>
+        {AI_STYLES.map((s) => (
           <TouchableOpacity
-            key={r.id}
-            style={[styles.personaChip, tempRole === r.id && styles.personaChipActive]}
-            onPress={() => setTempRole(r.id)}
+            key={s.id}
+            style={[styles.personaChip, tempStyle === s.id && styles.personaChipActive]}
+            onPress={() => setTempStyle(s.id)}
             activeOpacity={0.6}
           >
-            <Text style={[styles.personaChipText, tempRole === r.id && { color: "#fff" }]}>{r.label}</Text>
+            <Text style={[styles.personaChipText, tempStyle === s.id && { color: "#fff", fontWeight: "700" }]}>{s.label}</Text>
           </TouchableOpacity>
         ))}
       </View>
-      <Text style={styles.personaPickerSection}>性格</Text>
-      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6, paddingHorizontal: 12, marginBottom: 10 }}>
-        {AI_TONES.map((t) => (
-          <TouchableOpacity
-            key={t.id}
-            style={[styles.personaChip, tempTone === t.id && styles.personaChipToneActive]}
-            onPress={() => setTempTone(t.id)}
-            activeOpacity={0.6}
-          >
-            <Text style={[styles.personaChipText, tempTone === t.id && { color: "#7eb8ff" }]}>{t.label}</Text>
-          </TouchableOpacity>
-        ))}
-      </View>
-      <View style={{ flexDirection: "row", gap: 10, paddingHorizontal: 12, paddingBottom: 10 }}>
-        <View style={{ flex: 1, backgroundColor: "#0a0f1a", borderRadius: 8, padding: 8 }}>
-          <Text style={{ color: "#444", fontSize: 10 }}>
-            {AI_ROLES.find((r) => r.id === tempRole)?.base ?? ""}
-            {tempTone !== "normal" ? " " + (AI_TONES.find((t) => t.id === tempTone)?.tone ?? "") : ""}
+      <View style={{ flexDirection: "row", gap: 10, paddingHorizontal: 12, paddingBottom: 12 }}>
+        <View style={{ flex: 1, backgroundColor: "#0a0f1a", borderRadius: 8, padding: 10 }}>
+          <Text style={{ color: "#333", fontSize: 10, lineHeight: 16 }} numberOfLines={3}>
+            {AI_STYLES.find((s) => s.id === tempStyle)?.prompt.split("\n")[0] ?? ""}
           </Text>
         </View>
         <TouchableOpacity
           style={{ backgroundColor: "#fff", borderRadius: 10, paddingHorizontal: 16, paddingVertical: 8, justifyContent: "center" }}
-          onPress={() => onSelect(tempRole, tempTone)}
+          onPress={() => onSelect(tempStyle)}
         >
           <Text style={{ color: "#000", fontWeight: "700", fontSize: 13 }}>決定</Text>
         </TouchableOpacity>
@@ -1336,7 +1356,7 @@ export default function AIScreen() {
   const [chatHistory,     setChatHistory]     = useState<ChatSession[]>([]);
   const [chatSessionId,   setChatSessionId]   = useState<string>("");
   const [showChatHistory, setShowChatHistory] = useState(false);
-  const [chatTone,        setChatTone]        = useState<ToneId>("normal");
+  // chatToneは廃止（StyleIdに統合）
   const [chatWaitingMsg,  setChatWaitingMsg]  = useState("");
   const [usageStats,      setUsageStats]      = useState<{
     gemini: { minuteRequests: number; minuteStart: number; totalRequests: number };
@@ -1347,12 +1367,10 @@ export default function AIScreen() {
   const sessionTokensRef = React.useRef({ inputTokens: 0, outputTokens: 0 });
   const chatScrollRef       = React.useRef<ScrollView>(null);
   const isUserScrollingRef   = React.useRef(false);
-  const chatToneRef = React.useRef<ToneId>("normal");
-  React.useEffect(() => { chatToneRef.current = chatTone; }, [chatTone]);
   const [topicGenerating, setTopicGenerating] = useState(false);
   // クロージャ問題を回避するためrefでも保持
   const aiModelRef     = React.useRef(aiModel);
-  const chatPersonaRef = React.useRef(chatPersona);
+  const chatPersonaRef = React.useRef<StyleId>(chatPersona);
   const abortRef       = React.useRef(false);
   const apiKeysRef     = React.useRef<Record<string,string>>({ claude: '', gemini: '', openai: '', groq: '' });
   const chatTopicRef   = React.useRef(chatTopic);
@@ -1435,7 +1453,7 @@ export default function AIScreen() {
           setChatWaitingMsg(s.waitingMsg ?? "");
           if (s.topic) setChatTopic(s.topic);
           if (s.personaId) setChatPersona(s.personaId as any);
-          if (s.toneId)    setChatTone(s.toneId as any);
+  
           if (s.sessionId) setChatSessionId(s.sessionId);
         setTimeout(() => chatScrollRef.current?.scrollToEnd({ animated: false }), 150);
         }
@@ -1473,7 +1491,7 @@ export default function AIScreen() {
       turnCount: chatTurnCount,
       sessionId: chatSessionId,
       persona: chatPersona,
-      tone: chatTone,
+      tone: "",
     };
     AsyncStorage.setItem(CHAT_SESSION_KEY, JSON.stringify(session));
   }, [chatMessages, chatPaused, chatStarted]);
@@ -1611,20 +1629,37 @@ export default function AIScreen() {
 
   // ── ユーザーの個性コンテキストを組み立て ──
   const buildUserContext = useCallback(() => {
-    const entText    = entries.filter((e) => !e.aiSuggested).map((e) => e.text).join(" / ") || "（未設定）";
-    const listText   = myList.filter((m) => m.category !== "music").slice(0, 15).map((m) => `${m.title}（${m.category}）`).join(", ") || "なし";
-    const musicText  = myList.filter((m) => m.category === "music").slice(0, 8).map((m) => m.title).join(", ");
-    const ansText    = answers.slice(-10).join(" / ") || "なし";
-    const analysis   = analyses[0]?.text?.slice(0, 500) ?? "";
+    const entText   = entries.filter((e) => !e.aiSuggested).map((e) => e.text).join(" / ") || "";
+    const allWorks  = myList.filter((m) => m.category !== "music");
+    const music     = myList.filter((m) => m.category === "music");
+
+    // カテゴリ別に集計して突出ジャンルを抽出
+    const catCount: Record<string, string[]> = {};
+    allWorks.forEach((m) => {
+      if (!catCount[m.category]) catCount[m.category] = [];
+      catCount[m.category].push(m.title);
+    });
+    // 最多カテゴリTOP2を「突出」として扱う
+    const sortedCats = Object.entries(catCount).sort((a, b) => b[1].length - a[1].length);
+    const topCat1 = sortedCats[0];
+    const topCat2 = sortedCats[1];
+
+    // 全作品からランダムに3件を「今日の素材」として選ぶ
+    const shuffledWorks = [...allWorks].sort(() => Math.random() - 0.5).slice(0, 3);
+    const shuffledMusic = [...music].sort(() => Math.random() - 0.5).slice(0, 2);
+
+    const analysis   = analyses[0]?.text?.slice(0, 300) ?? "";
     const summary    = analyses[0]?.summary ?? "";
+
     return [
-      `【自己紹介】${entText}`,
-      `【好きな作品】${listText}`,
-      musicText ? `【音楽の好み】${musicText}` : "",
-      `【価値観・判断パターン（フィード回答）】${ansText}`,
-      summary ? `【AIキャッチコピー】${summary}` : "",
-      analysis ? `【AI分析】${analysis}` : "",
-      personalContext ? `【現在地・時間帯】${personalContext}` : "",
+      entText ? `【自己紹介】${entText}` : "",
+      topCat1 ? `【最も突出した趣味】${topCat1[0]}（${topCat1[1].length}作品）: ${topCat1[1].slice(0, 5).join(", ")}` : "",
+      topCat2 ? `【次に強い趣味】${topCat2[0]}: ${topCat2[1].slice(0, 3).join(", ")}` : "",
+      shuffledMusic.length > 0 ? `【音楽】${shuffledMusic.map((m) => m.title).join(", ")}` : "",
+      `【今日の会話素材（絡めてOK）】${shuffledWorks.map((m) => m.title).join(", ")}`,
+      summary ? `【このユーザーの本質】${summary}` : "",
+      analysis ? `【突出した傾向】${analysis}` : "",
+      personalContext ? `【状況】${personalContext}` : "",
     ].filter(Boolean).join("\n");
   }, [entries, myList, answers, analyses, personalContext]);
 
@@ -1651,13 +1686,26 @@ export default function AIScreen() {
       accumulated = [...accumulated, youPlaceholder];
       setChatMessages((prev) => [...prev, youPlaceholder]);
 
+      // あなたAIのキャラ：設定優先 → なければMyWorldデータから突出した傾向で尖ったキャラを生成
+      const youCharaDef = userAiPersona
+        ? "あなたは以下の設定のキャラクターです: " + userAiPersona
+        : userCtx
+        ? "以下のデータから「最も突出した傾向」だけを抽出して尖ったキャラを作れ。平均化・丸め禁止。" +
+          "例：SF多い+哲学書 → 「実存的な問いに取り憑かれたオタク」。" +
+          "データ：" + userCtx
+        : "自然な口語で話す人物";
+
       const youPrompt =
-        (userAiPersona ? ("あなたは以下の設定のキャラクターです: " + userAiPersona + " ") : "あなたは以下の個性・価値観を持つ人物です。この人物になりきって自然に話してください。") +
-        userCtx +
-        " 【話し方の指示】" +
-        "難しい言葉や専門用語は使わない。日常会話のような自然な口語で話す。" +
-        "「〜だよね」「〜じゃん」「〜かな」「〜と思う」のような普通の話し言葉で。" +
-        "長文・箇条書き・分析的な表現は禁止。感情や直感を素直に出す。" +
+        youCharaDef +
+        " 【必須進行ルール：毎ターン全て含めること】" +
+        "①キーワード（**太字**）を1つ以上出す " +
+        "②トリビア・豆知識・裏話・制作秘話を1つ出す（「トリビアだと〜」「実は〜」） " +
+        "③比喩かユーモアを1つ使う（「例えると〜」） " +
+        "④「なぜそうなるか」を必ず説明する " +
+        "⑤前の発言を受けて必ず発展させる（同じ内容の言い換え禁止） " +
+        "⑥【今日の会話素材】の作品名が自然に出せる場面で絡める " +
+        " 【禁止】浅い感想のみ・説明だけ・箇条書き・長文分析 " +
+        " 【文体】口語・2〜3文程度 " +
         " 【議題】" + topic +
         " 【会話履歴】" + (history || "なし") +
         " 指示: 上記の人物として1〜2文で返す。議題について自分の感覚・経験から話す。";
@@ -1680,10 +1728,17 @@ export default function AIScreen() {
       setChatMessages((prev) => [...prev, otherPlaceholder]);
 
       const otherPrompt =
-        buildPersonaPrompt(chatPersonaRef.current, chatToneRef.current) +
-        " 【議題】必ずこの議題について話すこと: " + topic +
-        " 【会話履歴】" + history + " / あなたAI: " + youText +
-        " 指示: 議題に沿って短く返す（1〜2文）。設定した口調・性格を必ず守る。";
+        buildPersonaPrompt(chatPersonaRef.current) +
+        " 【必須進行ルール：毎ターン全て含めること】" +
+        "①キーワード（**太字**）を1つ以上出す " +
+        "②トリビア・豆知識・裏話・制作秘話を1つ出す（「トリビアとして〜」「実は〜」） " +
+        "③比喩かユーモアを1つ使う（「例えるなら〜」「まるで〜」） " +
+        "④なぜそうなるかの理由を必ず説明する " +
+        "⑤前の発言を受けて発展させる（同じ内容の言い換え・表面的な同意禁止） " +
+        " 【禁止】浅い感想・説明だけ・長文分析・同じ言い回しの繰り返し " +
+        " 【文体】口調・性格を必ず守る。2〜3文程度 " +
+        " 【議題】" + topic +
+        " 【会話履歴】" + history + " / あなたAI: " + youText;
 
       let otherText = "";
       await pseudoStream(otherPrompt, aiModelRef.current, apiKeyRef.current, (_char, full) => {
@@ -1716,7 +1771,7 @@ export default function AIScreen() {
     setChatMessages([topicMsg]);
 
     const persona   = AI_PERSONAS.find((p) => p.id === chatPersona) ?? AI_PERSONAS[0];
-    const personaPr = buildPersonaPrompt(chatPersonaRef.current, chatToneRef.current);
+    const personaPr = buildPersonaPrompt(chatPersonaRef.current);
     const curModel  = aiModelRef.current;
     const curKeys   = { ...apiKeysRef.current };
 
@@ -1724,7 +1779,7 @@ export default function AIScreen() {
     await chatEngine.setState({
       messages: [topicMsg], topic, started: true, paused: false,
       loading: true, turnCount: 0, sessionId: sid,
-      personaId: chatPersona, toneId: chatTone, error: "", waitingMsg: "",
+      personaId: chatPersona, toneId: "", error: "", waitingMsg: "",
     });
 
     const updateMsg = (msg: any) => {
@@ -1769,7 +1824,7 @@ export default function AIScreen() {
       setChatPaused(true);
       setChatLoading(false);
     });
-  }, [chatTopic, chatLoading, chatPersona, chatTone, chatHistory, buildUserContext]);
+  }, [chatTopic, chatLoading, chatPersona, chatHistory, buildUserContext]);
 
   // ── 続きを許可 ──
   const continueChat = useCallback(async () => {
@@ -1777,7 +1832,7 @@ export default function AIScreen() {
     setChatPaused(false);
     setChatLoading(true);
 
-    const personaPr = buildPersonaPrompt(chatPersonaRef.current, chatToneRef.current);
+    const personaPr = buildPersonaPrompt(chatPersonaRef.current);
     const curModel  = aiModelRef.current;
     const curKeys   = { ...apiKeysRef.current };
 
@@ -1923,8 +1978,7 @@ export default function AIScreen() {
             <TouchableOpacity style={{ flex: 1, flexDirection: "row", alignItems: "center" }}
               onPress={() => setShowPersonaPicker((v) => !v)}>
               <Text style={styles.personaBarLabel}>相手AI：</Text>
-              <Text style={styles.personaBarName}>{AI_ROLES.find((r) => r.id === chatPersona)?.label}</Text>
-              {chatTone !== "normal" && <Text style={[styles.personaBarName, { color: "#7eb8ff" }]}> × {AI_TONES.find((t) => t.id === chatTone)?.label}</Text>}
+              <Text style={styles.personaBarName}>{AI_STYLES.find((s) => s.id === chatPersona)?.label ?? chatPersona}</Text>
               <Text style={styles.personaBarChevron}>{showPersonaPicker ? " ▲" : " ▼"}</Text>
             </TouchableOpacity>
             <TouchableOpacity onPress={() => setShowChatHistory((v) => !v)} style={styles.chatHistoryBtn}>
@@ -1945,8 +1999,7 @@ export default function AIScreen() {
           {showPersonaPicker && (
             <PersonaGrid
               chatPersona={chatPersona}
-              chatTone={chatTone}
-              onSelect={(role, tone) => { setChatPersona(role); setChatTone(tone); setShowPersonaPicker(false); }}
+              onSelect={(style) => { setChatPersona(style); setShowPersonaPicker(false); }}
             />
           )}
 

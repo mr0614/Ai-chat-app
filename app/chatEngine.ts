@@ -294,9 +294,25 @@ class ChatEngine {
           : userContext
           ? "あなたはこのユーザーです。" + userContext + " このユーザーになりきって自然に話してください。"
           : "あなたは自然な口語で話す人物です。";
+        // キャラ定義：設定優先→MyWorldデータから突出した傾向で尖ったキャラ
+        const youCharaDef = userPersona
+          ? "あなたは以下の設定のキャラクターです: " + userPersona
+          : userContext
+          ? "以下のデータから「最も突出した傾向」だけを抽出して尖ったキャラを作れ。平均化・丸め禁止。" +
+            "例：SF多い+哲学書 → 「実存的な問いに取り憑かれたオタク」として話す。" +
+            "データ：" + userContext
+          : "自然な口語で話す人物";
+
         const youPrompt =
-          youPersonaBase +
-          " 【話し方】相手AIとは別人。自分の感覚・経験から短く返す。口語で1〜2文。分析・箇条書き禁止。" +
+          youCharaDef +
+          " 【必須：毎ターン以下を全て含める】" +
+          "①議題のキーワードを**太字**で1つ明示する " +
+          "②そのキーワードに関するトリビア・豆知識・裏話・制作秘話を1つ出す " +
+          "③比喩かユーモアを1つ使う（例えると〜） " +
+          "④なぜそうなるかの理由を説明する " +
+          "⑤前の発言を受けて新しい切り口で発展させる（言い換え・同意だけ禁止） " +
+          " 【禁止】他作品の無理な引用・浅い感想・箇条書き・長文分析 " +
+          " 【文体】口語。100〜150文字程度。 " +
           " 【議題】" + topicText +
           " 【会話履歴】" + history;
 
@@ -308,6 +324,8 @@ class ChatEngine {
         msgs = [...msgs, youPlaceholder];
         onMessage(youPlaceholder);
 
+        console.log('[ENGINE] userPersona:', userPersona?.slice(0,50), 'userContext:', userContext?.slice(0,50));
+        console.log('[ENGINE] youPrompt first 300:', youPrompt.slice(0, 300));
         const youText = await callModel(youPrompt, 150);
         if (this.aborted) break;
         // 疑似ストリーミング
@@ -327,7 +345,14 @@ class ChatEngine {
         // 相手AI
         const otherPrompt =
           personaPrompt +
-          " 話し方: 自然な口語。毎回違う切り口。同じ言い回しを繰り返さない。" +
+          " 【必須：毎ターン以下を全て含める】" +
+          "①議題のキーワードを**太字**で1つ明示する " +
+          "②そのキーワードに関するトリビア・豆知識・裏話・制作秘話を1つ出す " +
+          "③比喩かユーモアを1つ使う（例えるなら〜） " +
+          "④なぜそうなるかの理由を説明する " +
+          "⑤前の発言を受けて新しい切り口で発展させる（言い換え・同意だけ禁止） " +
+          " 【禁止】他作品の無理な引用・浅い感想・長文分析 " +
+          " 【文体】口調・性格を必ず守る。100〜150文字程度。 " +
           " 【議題】" +
           topicText +
           " 【会話履歴】" +
