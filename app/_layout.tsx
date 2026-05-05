@@ -29,9 +29,11 @@ export default function RootLayout() {
     const unsub = chatEngine.subscribe(async () => {
       const s = await chatEngine.getState();
       setChatLoading(s.loading);
-      setChatWaiting(s.waitingMsg ?? "");
     });
-    return unsub;
+    const unsubWaiting = chatEngine.subscribeWaiting((msg) => {
+      setChatWaiting(msg);
+    });
+    return () => { unsub(); unsubWaiting(); };
   }, []);
 
   const getPathAtX = (px: number) => {

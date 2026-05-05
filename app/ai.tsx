@@ -14,12 +14,13 @@
  */
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { AI_STYLES, buildPersonaPrompt, CHAT_STYLE_RULE, buildYouCharaDef } from "../lib/prompts";
 
 // ─── Chat Engine（インライン）────────────────────────────
 // chatEngine.ts — タブをまたいで動き続ける会話エンジン
 // _layout.tsxでインスタンス化し、ai.tsxはAsyncStorageで状態を参照する
 
-const CHAT_STATE_KEY   = "chat_engine_state";
+const CHAT_STATE_KEY = "chat_engine_state";
 const CHAT_PARTIAL_KEY = "chat_engine_partial";
 
 interface EngineMessage {
@@ -29,16 +30,16 @@ interface EngineMessage {
 }
 
 interface ChatEngineState {
-  messages:   EngineMessage[];
-  topic:      string;
-  started:    boolean;
-  paused:     boolean;
-  loading:    boolean;
-  turnCount:  number;
-  sessionId:  string;
-  personaId:  string;
-  toneId:     string;
-  error:      string;
+  messages: EngineMessage[];
+  topic: string;
+  started: boolean;
+  paused: boolean;
+  loading: boolean;
+  turnCount: number;
+  sessionId: string;
+  personaId: string;
+  toneId: string;
+  error: string;
   waitingMsg: string; // "Gemini間隔待機中..." などの状態メッセージ
 }
 
@@ -100,10 +101,10 @@ class ChatEngine {
     userContext: string = "",
     userPersona: string = "",
   ): Promise<void> {
-    this.running  = true;
-    this.aborted  = false;
+    this.running = true;
+    this.aborted = false;
     console.log("[ChatEngine] runTurns start", { model, turns, personaPrompt: personaPrompt.slice(0, 50) });
-    const state   = await this.getState();
+    const state = await this.getState();
     await this.setState({ loading: true, paused: false, error: "", waitingMsg: "" });
 
     const callModel = async (prompt: string, maxTokens: number): Promise<string> => {
@@ -113,14 +114,16 @@ class ChatEngine {
         if (!key) throw new Error("GeminiのAPIキーが未設定です\naistudio.google.comで無料取得できます");
         for (let attempt = 0; attempt < 3; attempt++) {
           if (this.aborted) return "";
-          this.recordGemini().catch(() => {});
+          this.recordGemini().catch(() => { });
           console.log("[Gemini] fetching, attempt:", attempt, "key starts:", key.slice(0, 8));
           let res: Response;
           try {
             res = await fetch(
               "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" + key,
-              { method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } } }) }
+              {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } } })
+              }
             );
           } catch (netErr: any) {
             console.error("[Gemini] network error:", netErr?.message);
@@ -129,7 +132,7 @@ class ChatEngine {
           console.log("[Gemini] response status:", res.status);
           if (res.status === 429 || res.status === 503) {
             const waitSec = res.status === 503 ? 10 : 20 * (attempt + 1);
-            const label   = res.status === 503 ? "Gemini サーバー混雑" : "Gemini 429";
+            const label = res.status === 503 ? "Gemini サーバー混雑" : "Gemini 429";
             await this.setState({ waitingMsg: label + ": " + waitSec + "秒後にリトライ..." });
             await new Promise((r) => setTimeout(r, waitSec * 1000));
             await this.setState({ waitingMsg: "" });
@@ -163,7 +166,7 @@ class ChatEngine {
           if (!res.ok) throw new Error("OpenAI " + res.status + ": " + (d.error?.message ?? JSON.stringify(d)));
           const text = d.choices?.[0]?.message?.content?.trim() ?? "";
           if (!text) throw new Error("OpenAI空レスポンス: " + JSON.stringify(d));
-          this.recordTokens("openai", d.usage?.prompt_tokens ?? 0, d.usage?.completion_tokens ?? 0).catch(() => {});
+          this.recordTokens("openai", d.usage?.prompt_tokens ?? 0, d.usage?.completion_tokens ?? 0).catch(() => { });
           return text;
         } catch (fetchErr: any) {
           console.error("[ChatEngine] OpenAI fetch error:", fetchErr?.message ?? fetchErr);
@@ -180,9 +183,74 @@ class ChatEngine {
           headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
           body: JSON.stringify({ model: "llama-3.3-70b-versatile", messages: [{ role: "user", content: prompt }], max_tokens: maxTokens }),
         });
-        const d = await res.json();
+        const groqBody = await res.text();
         console.log("[Groq] status:", res.status);
-        if (!res.ok) throw new Error("Groq " + res.status + ": " + (d.error?.message ?? ""));
+        if (res.status === 429) {
+          const kind = groqBody.includes("TPD") ? "トークン" : "リクエスト";
+          const rawMsg = (() => { try { return JSON.parse(groqBody)?.error?.message ?? groqBody; } catch { return groqBody; } })();
+          // "Used 99794" "Limit 100000" を抽出してusage_statsを更新
+          const usedMatch = rawMsg.match(/Used\s+(\d+)/);
+          const limitMatch = rawMsg.match(/Limit\s+(\d+)/);
+          if (usedMatch || limitMatch) {
+            try {
+              const j = await AsyncStorage.getItem("ai_usage_stats");
+              const u = j ? JSON.parse(j) : {};
+              if (!u.groq) u.groq = {};
+              if (usedMatch) u.groq.dailyUsed = parseInt(usedMatch[1]);
+              if (limitMatch) {
+                const limit = parseInt(limitMatch[1]);
+                u.groq.limitTpd = limit;
+                if (usedMatch) {
+                  u.groq.remainingTpd = limit - parseInt(usedMatch[1]);
+                  u.groq.remainingTpdAt = Date.now(); // 取得時刻を保存
+                }
+              }
+              await AsyncStorage.setItem("ai_usage_stats", JSON.stringify(u));
+            } catch {}
+          }
+          // "Please try again in 1m30s" や "in 45.5s" から秒数を抽出
+          const secMatch = rawMsg.match(/in\s+(?:(\d+)m)?(\d+(?:\.\d+)?)s/);
+          const waitSec = secMatch
+            ? (secMatch[1] ? parseInt(secMatch[1]) * 60 : 0) + Math.ceil(parseFloat(secMatch[2]))
+            : 0;
+          const waitTag = waitSec > 0 ? `\n[WAIT:${waitSec}]` : "";
+          throw new Error("Groq 429\n" + rawMsg + "\n\n本日の" + kind + "上限に達しました。無料枠: 10万トークン/日 / リセット: 毎日9:00(JST)" + waitTag);
+        }
+        const d = JSON.parse(groqBody);
+        if (!res.ok) {
+          const rawMsg = d.error?.message ?? groqBody;
+          const jaMsg = res.status === 401 ? "APIキーが無効です。設定を確認してください。" :
+            res.status === 403 ? "アクセスが拒否されました。" :
+            res.status === 500 ? "Groqサーバーエラーです。しばらく待ってください。" :
+            "不明なエラーが発生しました。";
+          throw new Error("Groq " + res.status + "\n" + rawMsg + "\n\n" + jaMsg);
+        }
+        const usage = d.usage;
+        if (usage) {
+          try {
+            const j = await AsyncStorage.getItem("ai_usage_stats");
+            const u = j ? JSON.parse(j) : { gemini: { minuteRequests: 0, minuteStart: Date.now(), totalRequests: 0, timestamps: [] }, claude: { inputTokens: 0, outputTokens: 0, cost: 0 }, openai: { inputTokens: 0, outputTokens: 0, cost: 0 }, groq: { promptTokens: 0, completionTokens: 0, totalTokens: 0, dailyUsed: 0 } };
+            if (!u.groq) u.groq = { promptTokens: 0, completionTokens: 0, totalTokens: 0, dailyUsed: 0 };
+            u.groq.promptTokens += usage.prompt_tokens ?? 0;
+            u.groq.completionTokens += usage.completion_tokens ?? 0;
+            u.groq.totalTokens += usage.total_tokens ?? 0;
+            u.groq.dailyUsed += usage.total_tokens ?? 0;
+            // レスポンスヘッダーから残量を取得（こちらが正確）
+            const remainingTpd = res.headers.get("x-ratelimit-remaining-tokens-day");
+            const limitTpd = res.headers.get("x-ratelimit-limit-tokens-day");
+            const remainingTpm = res.headers.get("x-ratelimit-remaining-tokens");
+            const resetTpm = res.headers.get("x-ratelimit-reset-tokens");
+            if (remainingTpd !== null) {
+              u.groq.remainingTpd = parseInt(remainingTpd);
+              u.groq.remainingTpdAt = Date.now(); // 取得時刻を保存
+            }
+            if (limitTpd !== null) u.groq.limitTpd = parseInt(limitTpd);
+            if (remainingTpm !== null) u.groq.remainingTpm = parseInt(remainingTpm);
+            if (resetTpm !== null) u.groq.resetTpm = resetTpm;
+            console.log("[Groq] headers: remainingTpd=", remainingTpd, "remainingTpm=", remainingTpm, "resetTpm=", resetTpm);
+            await AsyncStorage.setItem("ai_usage_stats", JSON.stringify(u));
+          } catch {}
+        }
         return d.choices?.[0]?.message?.content?.trim() ?? "";
       }
 
@@ -196,65 +264,75 @@ class ChatEngine {
       });
       const d = await res.json();
       if (!res.ok) throw new Error("Claude " + res.status + ": " + (d.error?.message ?? ""));
-      this.recordTokens("claude", d.usage?.input_tokens ?? 0, d.usage?.output_tokens ?? 0).catch(() => {});
+      this.recordTokens("claude", d.usage?.input_tokens ?? 0, d.usage?.output_tokens ?? 0).catch(() => { });
       return d.content?.[0]?.text?.trim() ?? "";
     };
 
     // topicはstateから1回だけ取得
     const initState = await this.getState();
-    console.log('[ENGINE] userPersona:', userPersona?.slice(0,50), 'ctx:', userContext?.slice(0,60));
+    console.log('[ENGINE] userPersona:', userPersona?.slice(0, 50), 'ctx:', userContext?.slice(0, 60));
     const topicText = initState.topic || initState.messages?.find((m: any) => m.role === "topic")?.text || "";
     console.log("[ChatEngine] topic:", topicText, "msgs:", initState.messages?.length);
 
-    const variations = [
-      "今回は質問で返す。",
-      "今回は具体的な例を出す。",
-      "今回は相手の言葉を引用してから切り込む。",
-      "今回は予想外の角度から返す。",
-      "今回は短く断言する。",
-      "今回は少し感情的に返す。",
-      "今回は逆説的な視点を出す。",
-      "今回は相手の前提を疑う。",
-    ];
+
 
     try {
       let msgs = [...(initState.messages ?? [])];
 
+      // 会話履歴内で繰り返される固有名詞を代名詞に置換するヘルパー
+      const dedupeNouns = (history: string, topic: string): string => {
+        if (!topic || topic.length < 2) return history;
+        const escaped = topic.split("").map((c) =>
+          /[.*+?^${}()|[\]\\]/.test(c) ? "\\" + c : c
+        ).join("");
+        let count = 0;
+        return history.replace(new RegExp(escaped, "g"), () => {
+          count++;
+          return count <= 1 ? topic : "彼";
+        });
+      };
+
+      // streaming中や空テキストを除いた確定済みメッセージのみを返すヘルパー
+      const confirmedHistory = (ms: any[], n = 2) => {
+        const seen = new Set<string>();
+        return ms
+          .filter((m: any) => m.role !== "topic" && !m.streaming && m.text.trim() !== "")
+          .slice(-n)
+          .filter((m: any) => {
+            const key = m.role + m.text.slice(0, 30);
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          })
+          .map((m: any) => (m.role === "you" ? "あなたAI" : "相手AI") + ": " + m.text.slice(0, 120))
+          .join("\n") || "なし";
+      };
+
       for (let t = 0; t < turns; t++) {
         if (this.aborted) break;
-        console.log("[ChatEngine] turn", t + 1, "of", turns);
-        const history = msgs
-          .filter((m: any) => m.role !== "topic")
-          .slice(-4)
-          .map((m: any) => (m.role === "you" ? "あなたAI" : "相手AI") + ": " + m.text)
-          .join(" / ") || "なし";
-
-        const variation = variations[Math.floor(Math.random() * variations.length)];
 
         // ── あなたAI ──
-        const youCharaDef = userPersona
-          ? "あなたは以下の設定のキャラクターです: " + userPersona
-          : userContext
-          ? "以下のデータから最も突出した傾向だけを抽出して尖ったキャラを作れ。平均化禁止。" +
-            "データ：" + userContext
-          : "自然な口語で話す人物";
+        const youCharaDef = buildYouCharaDef(userPersona, userContext);
+
+        // あなたAI用のhistoryは確定済みメッセージのみ
+        const youHistory = dedupeNouns(confirmedHistory(msgs), topicText);
+
+        const topicInstruction = t === 0
+          ? "\n【話題のきっかけ】" + topicText
+          : "";
         const youPrompt =
           youCharaDef +
-          " 【必須：毎ターン以下を全て含める】" +
-          "①議題のキーワードを**太字**で1つ明示する " +
-          "②そのキーワードに関するトリビア・豆知識・裏話・制作秘話を1つ出す " +
-          "③比喩かユーモアを1つ使う（例えると〜） " +
-          "④なぜそうなるかの理由を説明する " +
-          "⑤前の発言を受けて新しい切り口で発展させる（言い換え・同意だけ禁止） " +
-          " 【禁止】他作品の無理な引用・浅い感想・箇条書き・長文分析 " +
-          " 【文体】口語。100〜150文字程度。 " +
-          " 【議題】" + topicText +
-          " 【会話履歴】" + history;
+          CHAT_STYLE_RULE +
+          topicInstruction +
+          "\n【会話履歴】\n" + youHistory +
+          "\nあなたAI:";
+        console.log("=== [InlineChatEngine] youPrompt ===", youPrompt);
+
         const youPlaceholder: EngineMessage = { role: "you", text: "", streaming: true };
         msgs = [...msgs, youPlaceholder];
         onMessage(youPlaceholder);
 
-        const youFull = await callModel(youPrompt, 350);
+        const youFull = await callModel(youPrompt, 120);
         if (this.aborted) break;
 
         // 疑似ストリーミング（文字を1文字ずつ送る）
@@ -273,22 +351,22 @@ class ChatEngine {
         await new Promise((r) => setTimeout(r, 300));
 
         // ── 相手AI ──
-        const otherPrompt = personaPrompt +
-          " 【必須：毎ターン以下を全て含める】" +
-          "①議題のキーワードを**太字**で1つ明示する " +
-          "②そのキーワードに関するトリビア・豆知識・裏話・制作秘話を1つ出す " +
-          "③比喩かユーモアを1つ使う（例えるなら〜） " +
-          "④なぜそうなるかの理由を説明する " +
-          "⑤前の発言を受けて新しい切り口で発展させる（言い換え・同意だけ禁止） " +
-          " 【禁止】他作品の無理な引用・浅い感想・長文分析 " +
-          " 【文体】口調・性格を必ず守る。100〜150文字程度。 " +
-          " 【議題】" + topicText +
-          " 【会話履歴】" + history + " / あなたAI: " + youFull;
+        // 相手AI用のhistoryはyou確定後に再取得
+        const otherHistory = dedupeNouns(confirmedHistory(msgs), topicText);
+
+        // 相手AI：personaPromptはbuildPersonaPrompt()で合成済み（キャラ語尾+共通ルール）
+        const otherPrompt =
+          personaPrompt +
+          (t === 0 ? "\n【話題のきっかけ】" + topicText : "") +
+          "\n【会話履歴】\n" + otherHistory +
+          "\n相手AI:";
+        console.log("=== [InlineChatEngine] otherPrompt ===", otherPrompt);
+
         const otherPlaceholder: EngineMessage = { role: "other", text: "", streaming: true };
         msgs = [...msgs, otherPlaceholder];
         onMessage(otherPlaceholder);
 
-        const otherFull = await callModel(otherPrompt, 350);
+        const otherFull = await callModel(otherPrompt, 120);
         if (this.aborted) break;
 
         let otherStreamed = "";
@@ -316,7 +394,10 @@ class ChatEngine {
         error: "",
       });
     } catch (e: any) {
-      await this.setState({ loading: false, paused: true, error: e?.message ?? "エラーが発生しました", waitingMsg: "" });
+      const errText = e?.message ?? "エラーが発生しました";
+      console.log("[ChatEngine] catch error:", errText);
+      try { onMessage({ role: "other", text: errText }); } catch {}
+      await this.setState({ loading: false, paused: true, error: errText, waitingMsg: "" });
     }
     this.running = false;
     this.notify();
@@ -333,19 +414,19 @@ class ChatEngine {
       u.gemini.minuteStart = u.gemini.timestamps[0] ?? now;
       u.gemini.totalRequests += 1;
       await AsyncStorage.setItem("ai_usage_stats", JSON.stringify(u));
-    } catch {}
+    } catch { }
   }
 
   private async recordTokens(model: "claude" | "openai", input: number, output: number): Promise<void> {
     try {
-      const pricing = { claude: { input: 3/1e6, output: 15/1e6 }, openai: { input: 0.15/1e6, output: 0.60/1e6 } };
+      const pricing = { claude: { input: 3 / 1e6, output: 15 / 1e6 }, openai: { input: 0.15 / 1e6, output: 0.60 / 1e6 } };
       const j = await AsyncStorage.getItem("ai_usage_stats");
       const u = j ? JSON.parse(j) : { gemini: { minuteRequests: 0, minuteStart: Date.now(), totalRequests: 0 }, claude: { inputTokens: 0, outputTokens: 0, cost: 0 }, openai: { inputTokens: 0, outputTokens: 0, cost: 0 } };
-      u[model].inputTokens  += input;
+      u[model].inputTokens += input;
       u[model].outputTokens += output;
-      u[model].cost         += input * pricing[model].input + output * pricing[model].output;
+      u[model].cost += input * pricing[model].input + output * pricing[model].output;
       await AsyncStorage.setItem("ai_usage_stats", JSON.stringify(u));
-    } catch {}
+    } catch { }
   }
 }
 
@@ -355,6 +436,7 @@ const chatEngine = new ChatEngine();
 
 // ─── End Chat Engine ────────────────────────────────────
 
+import { useFocusEffect } from "expo-router";
 import React, { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
@@ -362,16 +444,15 @@ import {
   Easing,
   FlatList,
   Keyboard,
+  KeyboardAvoidingView,
+  Platform,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
   View,
-  Platform,
-  KeyboardAvoidingView,
 } from "react-native";
-import { useFocusEffect } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 // ─── 型 ──────────────────────────────────────────────────
@@ -379,88 +460,51 @@ interface Choice { label: string; text: string; }
 
 interface ExtraQA {
   question: string;
-  choices:  Choice[];
-  answer?:  string;
+  choices: Choice[];
+  answer?: string;
   reaction?: string;
 }
 
 interface FeedCard {
-  id:        string;
-  text:      string;           // 質問本文
-  choices:   Choice[];         // 選択肢（常にあり）
+  id: string;
+  text: string;           // 質問本文
+  choices: Choice[];         // 選択肢（常にあり）
   answered?: string;           // 最初の回答
   reaction?: string;           // 最初の回答へのリアクション
-  extraQAs:  ExtraQA[];        // 続けての会話履歴
+  extraQAs: ExtraQA[];        // 続けての会話履歴
   showReply: boolean;          // フォローアップ表示中
   createdAt: number;
-  loading:   boolean;
+  loading: boolean;
 }
 
-interface ListItem   { id: string; title: string; category: string; }
-interface Entry      { id: string; text: string; aiSuggested?: boolean; }
+interface ListItem { id: string; title: string; category: string; }
+interface Entry { id: string; text: string; aiSuggested?: boolean; }
 interface AnalysisRecord { id: string; text: string; summary: string; createdAt: number; }
 // ─── AI対話 型 ─────────────────────────────────────────────
 interface ChatMessage { role: "you" | "other" | "topic"; text: string; streaming?: boolean; }
 interface ChatSession { id: string; topic: string; messages: ChatMessage[]; personaId: string; createdAt: number; }
 
-// ─── 相手AIの口調スタイル ────────────────────────────────
-const AI_STYLES = [
-  {
-    id: "obasan",
-    label: "おばさん",
-    prompt: `おばさん構文で話す。
-【話し方】
-・文頭はランダムに「あら／あらら〜／あらまぁ／まぁねぇ／そうねぇ／あのねぇ／ちょっとねぇ」から選ぶ
-・語尾は「〜よ／〜だわ／〜よん／〜かしら／〜なのよ／〜なのよねぇ」
-・「しぃ」はポジティブ限定で1回まで（楽しぃ／嬉しぃ）
-・「〜」を1文1回以上多用
-・「...」を適度に使う
-・あ行小文字（わぁ／だょ／ねぇ）を1回以上使う
-・文章は長め（3〜4文）。1〜2文で終わらせない
-・軽いお母さん目線・世間話感覚を含める
-・裏話や豆知識があれば「そういえばねぇ〜」「知ってる？」と自然につなげる
-
-【内容】説明禁止。感情・体験・記憶ベースで話す。余韻（「ほんとに…」「もう〜」）を入れる。他の作品や体験と絡めた話も歓迎。
-【絵文字】文中・文末に分散。感情や単語に一致する絵文字を優先。単体/3連/2同1異を2:7:1の比率で。❗️は最大2連まで。驚きは顔絵文字で表現（😳😲😮😧😨😱😵‍💫🤯）。ハートは複数バリエーション（❤️💖💗💓💕💞💘💝）。同じ絵文字セット連続禁止。説明文のみNG。`,
-  },
-  {
-    id: "nanj",
-    label: "なんJ民",
-    prompt: `なんJ民の口調で話す。
-【話し方】語尾は「〜やろ／〜やん／〜ンゴ／〜定期／〜草」を使う。文頭は「はぁ？／せやな／ほんまそれ／ワイ的には／草生える」などランダムに。ツッコミ・煽り・共感が混在する。カタカナ多め。横断的な知識をひけらかす。「w」「草」を笑いに使う。長文は避けて短くテンポよく。絵文字は基本使わないが「草」「ンゴ」「定期」はOK。`,
-  },
-  {
-    id: "gyaru",
-    label: "ギャル",
-    prompt: `ギャル口調で話す。
-【話し方】「〜じゃん／〜だし／〜くね？／〜みたいな／〜てか」を語尾に使う。文頭は「えー！／マジ？／てかさー／やばくね？／うける」など。感情表現が豊か。「ヤバい」「マジ」「超」「激」を多用。テンション高め。友達感覚で距離感ゼロ。絵文字は多め（💅🔥✨😂💦🙏）でテンション重視。説明より感情リアクションを優先。`,
-  },
-] as const;
+// ─── 相手AIの口調スタイル（prompts.ts で一元管理） ────────
 
 type StyleId = typeof AI_STYLES[number]["id"];
-type RoleId = StyleId; // 後方互換
-type ToneId = "normal"; // 後方互換（未使用）
+type RoleId = StyleId;
+type ToneId = "normal";
 type PersonaId = StyleId;
-const AI_ROLES = AI_STYLES; // 後方互換
+const AI_ROLES = AI_STYLES;
 const AI_TONES = [{ id: "normal", label: "普通", tone: "" }] as const;
 const AI_PERSONAS = AI_STYLES.map((s) => ({ ...s, base: s.prompt, desc: s.prompt }));
 
-function buildPersonaPrompt(styleId: StyleId, _toneId?: string): string {
-  const style = AI_STYLES.find((s) => s.id === styleId) ?? AI_STYLES[0];
-  return style.prompt;
-}
-
-const MODEL_KEY        = "ai_model_setting";
-const APIKEY_CLAUDE    = "ai_apikey_claude";
-const APIKEY_GEMINI    = "ai_apikey_gemini";
-const APIKEY_OPENAI    = "ai_apikey_openai";
-const APIKEY_GROQ      = "ai_apikey_groq";
-const CHAT_HISTORY_KEY    = "ai_chat_history_v1";
-const CHAT_SESSION_KEY    = "ai_chat_session_v1"; // 進行中の会話を保存
+const MODEL_KEY = "ai_model_setting";
+const APIKEY_CLAUDE = "ai_apikey_claude";
+const APIKEY_GEMINI = "ai_apikey_gemini";
+const APIKEY_OPENAI = "ai_apikey_openai";
+const APIKEY_GROQ = "ai_apikey_groq";
+const CHAT_HISTORY_KEY = "ai_chat_history_v1";
+const CHAT_SESSION_KEY = "ai_chat_session_v1"; // 進行中の会話を保存
 
 // ─── ストレージ ───────────────────────────────────────────
-const FEED_KEY     = "ai_feed_v5";
-const ANSWERS_KEY  = "ai_answers_v5";
+const FEED_KEY = "ai_feed_v5";
+const ANSWERS_KEY = "ai_answers_v5";
 const ANALYSIS_KEY = "ai_analysis_v5";
 
 // ─── Claude API ───────────────────────────────────────────
@@ -470,9 +514,9 @@ async function callClaude(messages: { role: string; content: string }[], maxToke
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
-      "Content-Type":                        "application/json",
-      "x-api-key":                           API_KEY,
-      "anthropic-version":                   "2023-06-01",
+      "Content-Type": "application/json",
+      "x-api-key": API_KEY,
+      "anthropic-version": "2023-06-01",
       "anthropic-dangerous-request-allowed": "true",
     },
     body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: maxTokens, messages }),
@@ -523,12 +567,14 @@ async function pseudoStream(
       if (attempt > 0) await new Promise((r) => setTimeout(r, 1500 * attempt));
       const res = await fetch(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" + key,
-        { method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } } }) }
+        {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } } })
+        }
       );
       if (res.status === 429) {
         lastErr = "Geminiのレート制限に達しました。しばらく待って再試行しています...";
-          _lastGeminiRequest = Date.now() + 10000;
+        _lastGeminiRequest = Date.now() + 10000;
         continue;
       }
       if (!res.ok) { const d = await res.json(); const msg = d.error?.message ?? "不明なエラー"; throw new Error(res.status === 400 ? "GeminiのAPIキーが無効です。設定で確認してください" : res.status === 403 ? "GeminiのAPIキーに権限がありません" : "Gemini " + res.status + ": " + msg); }
@@ -547,7 +593,7 @@ async function pseudoStream(
     if (!res.ok) { const d = await res.json(); const msg = d.error?.message ?? "不明なエラー"; throw new Error(res.status === 401 ? "OpenAI APIキーが無効です。設定で確認してください" : "OpenAI " + res.status + ": " + msg); }
     const d = await res.json();
     full = d.choices?.[0]?.message?.content?.trim() ?? "";
-    if (d.usage) recordTokenUsage("openai", d.usage.prompt_tokens ?? 0, d.usage.completion_tokens ?? 0).catch(() => {});
+    if (d.usage) recordTokenUsage("openai", d.usage.prompt_tokens ?? 0, d.usage.completion_tokens ?? 0).catch(() => { });
   } else if (model === "groq") {
     const key = apiKey || "";
     if (!key) throw new Error("GroqのAPIキーが未設定です");
@@ -570,7 +616,7 @@ async function pseudoStream(
     if (!res.ok) { const d = await res.json(); const msg = d.error?.message ?? "不明なエラー"; throw new Error(res.status === 401 ? "Anthropic APIキーが無効です。設定で確認してください" : "Claude " + res.status + ": " + msg); }
     const d = await res.json();
     full = d.content?.[0]?.text?.trim() ?? "";
-    if (d.usage) recordTokenUsage("claude", d.usage.input_tokens ?? 0, d.usage.output_tokens ?? 0).catch(() => {});
+    if (d.usage) recordTokenUsage("claude", d.usage.input_tokens ?? 0, d.usage.output_tokens ?? 0).catch(() => { });
   }
 
   if (!full) throw new Error("empty response");
@@ -633,9 +679,9 @@ async function recordGeminiRequest(): Promise<UsageStats> {
 async function recordTokenUsage(model: "claude" | "openai", inputTokens: number, outputTokens: number): Promise<void> {
   const u = await loadUsage();
   const p = PRICING[model];
-  u[model].inputTokens  += inputTokens;
+  u[model].inputTokens += inputTokens;
   u[model].outputTokens += outputTokens;
-  u[model].cost         += inputTokens * p.input + outputTokens * p.output;
+  u[model].cost += inputTokens * p.input + outputTokens * p.output;
   await AsyncStorage.setItem(USAGE_KEY, JSON.stringify(u));
 }
 
@@ -649,7 +695,7 @@ async function geminiRateLimit(): Promise<void> {
   if (wait > 0) await new Promise((r) => setTimeout(r, wait));
   _lastGeminiRequest = Date.now();
   // fetch直前に呼ばれるのでここでカウント（成功・失敗問わず実リクエスト数）
-  recordGeminiRequest().catch(() => {});
+  recordGeminiRequest().catch(() => { });
 }
 
 // グローバルAPIコール（フィード・分析用）- モデル設定に従って呼び分け
@@ -667,12 +713,14 @@ async function callWithModel(
       if (attempt > 0) await new Promise((r) => setTimeout(r, 3000 * attempt));
       const res = await fetch(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" + key,
-        { method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } } }) }
+        {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } } })
+        }
       );
       if (res.status === 429) { if (attempt === 2) throw new Error("Gemini 429: しばらく待ってから試してください"); continue; }
       if (!res.ok) { const d = await res.json(); throw new Error("Gemini " + res.status + ": " + (d.error?.message ?? "")); }
-      recordGeminiRequest().catch(() => {});
+      recordGeminiRequest().catch(() => { });
       const d = await res.json();
       return d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
     }
@@ -707,7 +755,7 @@ let _globalChatActive = false;
 // モジュールレベルでrunBlockを実行するためのコールバック群
 // unmount後もsetChatMessagesをAsyncStorage経由で保存し続ける
 let _onChatMessage: ((msg: { role: string; text: string; streaming?: boolean }) => void) | null = null;
-let _onChatDone:    ((paused: boolean, turnCount: number) => void) | null = null;
+let _onChatDone: ((paused: boolean, turnCount: number) => void) | null = null;
 let _abortFlag = false;
 
 async function runBlockGlobal(
@@ -722,24 +770,27 @@ async function runBlockGlobal(
   _abortFlag = false;
   let accumulated = [...startMessages];
 
+  // DEEP_DIALOGUE_RULE：CHAT_STYLE_RULE のみ。知識・引用の強制はしない
+  const DEEP_DIALOGUE_RULE = CHAT_STYLE_RULE;
+
   for (let t = 0; t < TURNS_PER_BLOCK; t++) {
     if (_abortFlag) break;
 
     const history = accumulated
-      .filter((m) => m.role !== "topic")
+      .filter((m) => m.role !== "topic" && m.text.trim() !== "")
       .slice(-4)
-      .map((m) => (m.role === "you" ? "あなたAI" : persona.label) + ": " + m.text)
-      .join(" / ");
+      .map((m) => (m.role === "you" ? "あなたAI" : persona.label) + ": " + m.text.slice(0, 120))
+      .join("\n");
 
     const turning = (startTurn + t) > 0 && (startTurn + t) % 5 === 0;
-    const apiKey  = apiKeys[model as "claude" | "gemini" | "openai"] ?? "";
+    const apiKey = apiKeys[model as "claude" | "gemini" | "openai"] ?? "";
 
     const youPrompt =
-      "あなたは以下の個性・価値観を持つ人物です。" + userCtx +
-      " 話し方: 日常の口語。「じゃん」「だよね」「かな」「と思う」を使う。長文・箇条書き禁止。" +
-      " 【議題】" + topic + " 【会話履歴】" + (history || "なし") +
-      (turning ? " 今回は本音を少し漏らして返す。" : "") +
-      " 1〜2文で返す。";
+      DEEP_DIALOGUE_RULE +
+      (t === 0 ? "\n【話題のきっかけ】" + topic + "（この話題から自由に広げてよい）" : "") +
+      "\n【会話履歴】\n" + (history || "なし") +
+      "\nあなたAI:";
+    console.log("=== [runDeepDialogue] youPrompt ===", youPrompt);
 
     const youPlaceholder = { role: "you" as const, text: "", streaming: true };
     accumulated = [...accumulated, youPlaceholder];
@@ -750,36 +801,31 @@ async function runBlockGlobal(
       if (_abortFlag) return;
       youText = full;
       _onChatMessage?.({ role: "you", text: full, streaming: true });
-    }, { current: _abortFlag } as any, 150);
+    }, { current: _abortFlag } as any, 300);
 
     const youMsg = { role: "you" as const, text: youText };
     accumulated = [...accumulated.slice(0, -1), youMsg];
     _onChatMessage?.({ ...youMsg });
 
     // AsyncStorageにも保存
-    AsyncStorage.setItem("ai_chat_partial", JSON.stringify(accumulated)).catch(() => {});
+    AsyncStorage.setItem("ai_chat_partial", JSON.stringify(accumulated)).catch(() => { });
     if (_abortFlag) break;
     await new Promise((r) => setTimeout(r, 300));
 
-    // 毎回違う返し方をするよう、バリエーション指示をランダムに追加
-    const responseVariations = [
-      "今回は質問で返す。",
-      "今回は具体的なエピソードや例を出す。",
-      "今回は相手の言葉を一部引用してから切り込む。",
-      "今回は予想外の角度から返す。",
-      "今回は短く断言する。",
-      "今回は少し感情的に返す。",
-      "今回は逆説的な視点を出す。",
-      "今回は相手の前提を疑う。",
-    ];
-    const variation = turning
-      ? "今回は核心を突く問いを投げる。"
-      : responseVariations[Math.floor(Math.random() * responseVariations.length)];
+
+    const otherHistory = accumulated
+      .filter((m) => m.role !== "topic" && m.text.trim() !== "")
+      .slice(-4)
+      .map((m) => (m.role === "you" ? "あなたAI" : persona.label) + ": " + m.text.slice(0, 120))
+      .join("\n");
 
     const otherPrompt =
-      persona.prompt + " 話し方: 自然な口語。毎回違う切り口で返す。同じ言い回し・パターンを繰り返さない。" +
-      " 【議題】" + topic + " 【会話履歴】" + history + " / あなたAI: " + youText +
-      " " + variation + " 1〜2文。";
+      persona.prompt +
+      DEEP_DIALOGUE_RULE +
+      (t === 0 ? "\n【話題のきっかけ】" + topic + "（この話題から自由に広げてよい）" : "") +
+      "\n【会話履歴】\n" + otherHistory +
+      "\n相手AI:";
+    console.log("=== [runDeepDialogue] otherPrompt ===", otherPrompt);
 
     const otherPlaceholder = { role: "other" as const, text: "", streaming: true };
     accumulated = [...accumulated, otherPlaceholder];
@@ -790,13 +836,13 @@ async function runBlockGlobal(
       if (_abortFlag) return;
       otherText = full;
       _onChatMessage?.({ role: "other", text: full, streaming: true });
-    }, { current: _abortFlag } as any, 150);
+    }, { current: _abortFlag } as any, 300);
 
     const otherMsg = { role: "other" as const, text: otherText };
     accumulated = [...accumulated.slice(0, -1), otherMsg];
     _onChatMessage?.({ ...otherMsg });
 
-    AsyncStorage.setItem("ai_chat_partial", JSON.stringify(accumulated)).catch(() => {});
+    AsyncStorage.setItem("ai_chat_partial", JSON.stringify(accumulated)).catch(() => { });
     if (_abortFlag) break;
     await new Promise((r) => setTimeout(r, 300));
   }
@@ -811,18 +857,6 @@ async function callAI(
   if (model === "gemini") {
     // callAIはGeminiのレート制限節約のためClaudeを使用
     return await callClaude(messages, maxTokens);
-    const key = apiKey || process.env.EXPO_PUBLIC_GEMINI_API_KEY || "";
-    const contents = messages.map((m) => ({
-      role: m.role === "assistant" ? "model" : "user",
-      parts: [{ text: m.content }],
-    }));
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${key}`,
-      { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents, generationConfig: { maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } } }) }
-    );
-    const d = await res.json();
-    return d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
   }
   if (model === "openai") {
     const key = apiKey || process.env.EXPO_PUBLIC_OPENAI_API_KEY || "";
@@ -858,9 +892,9 @@ async function generateQuestion(
   entries: Entry[], myList: ListItem[], existing: FeedCard[], answers: string[],
   personalContext?: string, model = "claude", apiKey = ""
 ): Promise<{ text: string; choices: Choice[] }> {
-  const entText     = entries.filter((e) => !e.aiSuggested).map((e) => `- ${e.text}`).join("\n") || "（未入力）";
-  const listText    = myList.map((m) => `- ${m.title}（${m.category}）`).join("\n") || "（未追加）";
-  const recentText  = existing.filter((c) => !c.loading).slice(-8).map((c) => c.text).join("\n") || "なし";
+  const entText = entries.filter((e) => !e.aiSuggested).map((e) => `- ${e.text}`).join("\n") || "（未入力）";
+  const listText = myList.map((m) => `- ${m.title}（${m.category}）`).join("\n") || "（未追加）";
+  const recentText = existing.filter((c) => !c.loading).slice(-8).map((c) => c.text).join("\n") || "なし";
   const answersText = answers.slice(-15).join("\n") || "なし";
   const personalInfo = personalContext ? `\n【スマホから取得した個人データ】\n${personalContext}` : "";
 
@@ -906,7 +940,7 @@ ${recentText}
 JSONのみ:
 {"text":"質問本文","choices":[{"label":"A","text":"..."},{"label":"B","text":"..."}]}`;
 
-  const raw   = await callClaude([{ role: "user", content: prompt }], 700);
+  const raw = await callClaude([{ role: "user", content: prompt }], 700);
   const match = raw.match(/\{[\s\S]*\}/);
   if (!match) return { text: "マイリストの中で、今の自分の気分に一番近い作品は？", choices: [{ label: "A", text: "静かに向き合いたい" }, { label: "B", text: "エネルギーをもらいたい" }] };
   const p = JSON.parse(match[0]);
@@ -960,7 +994,7 @@ async function generateFollowUp(
 JSONのみ:
 {"question":"追加質問","choices":[{"label":"A","text":"..."},{"label":"B","text":"..."}]}`;
 
-  const raw   = await callWithModel(prompt, model, apiKey, 400);
+  const raw = await callWithModel(prompt, model, apiKey, 400);
   const match = raw.match(/\{[\s\S]*\}/);
   if (!match) return { question: "もう少し詳しく教えてください。", choices: [{ label: "A", text: "そう思う" }, { label: "B", text: "そうでもない" }] };
   const p = JSON.parse(match[0]);
@@ -971,8 +1005,8 @@ JSONのみ:
 async function generateAnalysis(
   entries: Entry[], myList: ListItem[], answers: string[], model = "claude", apiKey = ""
 ): Promise<{ text: string; summary: string; suggestion: string }> {
-  const entText    = entries.filter((e) => !e.aiSuggested).map((e) => `- ${e.text}`).join("\n") || "（未入力）";
-  const listText   = myList.map((m) => `- ${m.title}（${m.category}）`).join("\n") || "（未追加）";
+  const entText = entries.filter((e) => !e.aiSuggested).map((e) => `- ${e.text}`).join("\n") || "（未入力）";
+  const listText = myList.map((m) => `- ${m.title}（${m.category}）`).join("\n") || "（未追加）";
   const answersText = answers.join("\n") || "なし";
 
   const prompt = `あなたは人間の個性・価値観を深く洞察する専門家です。
@@ -992,24 +1026,54 @@ ${answersText}
 }
 JSONのみ返答。`;
 
-  const raw   = await callWithModel(prompt, model, apiKey, 1800);
+  const raw = await callWithModel(prompt, model, apiKey, 1800);
   const match = raw.match(/\{[\s\S]*\}/);
   if (!match) throw new Error("parse error");
   const p = JSON.parse(match[0]);
   return { text: p.text ?? "", summary: p.summary ?? "", suggestion: p.suggestion ?? "" };
 }
 
+// ─── カウントダウン表示 ──────────────────────────────────
+function CountdownMessage({ text }: { text: string }) {
+  const waitMatch = text.match(/\[WAIT:(\d+)\]/);
+  const initialSec = waitMatch ? parseInt(waitMatch[1]) : 0;
+  const [remaining, setRemaining] = React.useState(initialSec);
+
+  React.useEffect(() => {
+    if (initialSec <= 0) return;
+    const timer = setInterval(() => {
+      setRemaining((prev) => {
+        if (prev <= 1) { clearInterval(timer); return 0; }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [initialSec]);
+
+  const displayText = text.replace(/\[WAIT:\d+\]/, "").trim();
+  return (
+    <Text style={{ color: "#e8e8e8", fontSize: 15, lineHeight: 24, flexShrink: 1 }}>
+      {displayText}
+      {initialSec > 0 && (
+        remaining > 0
+          ? `\n\n⏳ ${remaining}秒後に再試行できます`
+          : "\n\n✅ 再試行できます"
+      )}
+    </Text>
+  );
+}
+
 // ─── フィードカードUI ─────────────────────────────────────
 function FeedCardView({ card, onAnswer, onContinue, onExtraAnswer }: {
-  card:          FeedCard;
-  onAnswer:      (id: string, answer: string) => void;
-  onContinue:    (id: string) => void;
+  card: FeedCard;
+  onAnswer: (id: string, answer: string) => void;
+  onContinue: (id: string) => void;
   onExtraAnswer: (id: string, answer: string) => void;
 }) {
-  const [freeText,       setFreeText]       = useState("");
-  const [showFree,       setShowFree]       = useState(false);
-  const [extraFreeText,  setExtraFreeText]  = useState("");
-  const [showExtraFree,  setShowExtraFree]  = useState(false);
+  const [freeText, setFreeText] = useState("");
+  const [showFree, setShowFree] = useState(false);
+  const [extraFreeText, setExtraFreeText] = useState("");
+  const [showExtraFree, setShowExtraFree] = useState(false);
 
   const submit = (text: string) => {
     if (!text.trim()) return;
@@ -1029,119 +1093,119 @@ function FeedCardView({ card, onAnswer, onContinue, onExtraAnswer }: {
   return (
     <View style={styles.feedCard}>
       {/* 質問本文 */}
-        <Text style={styles.feedCardText}>
-          {card.loading && !card.text ? "考えています..." : card.text}
-        </Text>
-        {card.loading && !card.text && (
-          <ActivityIndicator size="small" color="#555" style={{ marginTop: 8 }} />
-        )}
+      <Text style={styles.feedCardText}>
+        {card.loading && !card.text ? "考えています..." : card.text}
+      </Text>
+      {card.loading && !card.text && (
+        <ActivityIndicator size="small" color="#555" style={{ marginTop: 8 }} />
+      )}
 
-        {/* 選択肢（未回答時） */}
-        {!answered && !card.loading && (
+      {/* 選択肢（未回答時） */}
+      {!answered && !card.loading && (
+        <View style={styles.choicesWrap}>
+          {card.choices.map((c) => (
+            <TouchableOpacity key={c.label} style={styles.choiceBtn} onPress={() => submit(`${c.label}: ${c.text}`)}>
+              <Text style={styles.choiceLabel}>{c.label}</Text>
+              <Text style={styles.choiceText}>{c.text}</Text>
+            </TouchableOpacity>
+          ))}
+          {showFree ? (
+            <View style={styles.freeInputRow}>
+              <TextInput style={styles.freeInput} placeholder="自由に回答..." placeholderTextColor="#555"
+                value={freeText} onChangeText={setFreeText} returnKeyType="done"
+                onSubmitEditing={() => submit(freeText)} autoFocus />
+              <TouchableOpacity style={[styles.freeSubmitBtn, !freeText.trim() && styles.freeSubmitDisabled]}
+                onPress={() => submit(freeText)} disabled={!freeText.trim()}>
+                <Text style={styles.freeSubmitTxt}>送信</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <TouchableOpacity style={styles.freeBtn} onPress={() => setShowFree(true)}>
+              <Text style={styles.freeBtnTxt}>自由に回答する...</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      )}
+
+      {/* 最初の回答（常に残す） */}
+      {answered && (
+        <View style={styles.answeredWrap}>
+          <Text style={styles.answeredLabel}>あなたの回答</Text>
+          <Text style={styles.answeredText}>{card.answered}</Text>
+          {card.reaction
+            ? <Text style={styles.reactionText}>{card.reaction}</Text>
+            : <ActivityIndicator size="small" color="#555" style={{ marginTop: 6 }} />
+          }
+        </View>
+      )}
+
+      {/* 過去のフォローアップ会話 */}
+      {card.extraQAs.filter((qa) => !!qa.answer).map((qa, i) => (
+        <View key={i}>
+          <View style={styles.followUpQWrap}>
+            <Text style={styles.followUpQ}>{qa.question}</Text>
+          </View>
+          <View style={styles.extraAnswerWrap}>
+            <Text style={styles.extraAnswerText}>{qa.answer}</Text>
+            {qa.reaction && <Text style={styles.reactionText}>{qa.reaction}</Text>}
+          </View>
+        </View>
+      ))}
+
+      {/* 続けて会話するボタン */}
+      {answered && card.reaction && !card.showReply && (
+        <TouchableOpacity style={styles.continueBtn} onPress={() => onContinue(card.id)}>
+          <Text style={styles.continueBtnTxt}>続けて会話する</Text>
+        </TouchableOpacity>
+      )}
+
+      {/* フォローアップ質問（ローディング中） */}
+      {card.showReply && !pendingQA && (
+        <View style={styles.followUpLoadingRow}>
+          <ActivityIndicator size="small" color="#555" />
+          <Text style={styles.followUpLoadingTxt}>追加質問を考えています...</Text>
+        </View>
+      )}
+
+      {/* フォローアップ質問と選択肢 */}
+      {pendingQA && !pendingQA.answer && (
+        <View>
+          <View style={styles.followUpQWrap}>
+            <Text style={styles.followUpQ}>{pendingQA.question}</Text>
+          </View>
           <View style={styles.choicesWrap}>
-            {card.choices.map((c) => (
-              <TouchableOpacity key={c.label} style={styles.choiceBtn} onPress={() => submit(`${c.label}: ${c.text}`)}>
+            {pendingQA.choices.map((c) => (
+              <TouchableOpacity key={c.label} style={[styles.choiceBtn, styles.choiceBtnSub]}
+                onPress={() => submitExtra(`${c.label}: ${c.text}`)}>
                 <Text style={styles.choiceLabel}>{c.label}</Text>
                 <Text style={styles.choiceText}>{c.text}</Text>
               </TouchableOpacity>
             ))}
-            {showFree ? (
+            {showExtraFree ? (
               <View style={styles.freeInputRow}>
                 <TextInput style={styles.freeInput} placeholder="自由に回答..." placeholderTextColor="#555"
-                  value={freeText} onChangeText={setFreeText} returnKeyType="done"
-                  onSubmitEditing={() => submit(freeText)} autoFocus />
-                <TouchableOpacity style={[styles.freeSubmitBtn, !freeText.trim() && styles.freeSubmitDisabled]}
-                  onPress={() => submit(freeText)} disabled={!freeText.trim()}>
+                  value={extraFreeText} onChangeText={setExtraFreeText} returnKeyType="done"
+                  onSubmitEditing={() => submitExtra(extraFreeText)} autoFocus />
+                <TouchableOpacity style={[styles.freeSubmitBtn, !extraFreeText.trim() && styles.freeSubmitDisabled]}
+                  onPress={() => submitExtra(extraFreeText)} disabled={!extraFreeText.trim()}>
                   <Text style={styles.freeSubmitTxt}>送信</Text>
                 </TouchableOpacity>
               </View>
             ) : (
-              <TouchableOpacity style={styles.freeBtn} onPress={() => setShowFree(true)}>
+              <TouchableOpacity style={styles.freeBtn} onPress={() => setShowExtraFree(true)}>
                 <Text style={styles.freeBtnTxt}>自由に回答する...</Text>
               </TouchableOpacity>
             )}
           </View>
-        )}
+        </View>
+      )}
 
-        {/* 最初の回答（常に残す） */}
-        {answered && (
-          <View style={styles.answeredWrap}>
-            <Text style={styles.answeredLabel}>あなたの回答</Text>
-            <Text style={styles.answeredText}>{card.answered}</Text>
-            {card.reaction
-              ? <Text style={styles.reactionText}>{card.reaction}</Text>
-              : <ActivityIndicator size="small" color="#555" style={{ marginTop: 6 }} />
-            }
-          </View>
-        )}
-
-        {/* 過去のフォローアップ会話 */}
-        {card.extraQAs.filter((qa) => !!qa.answer).map((qa, i) => (
-          <View key={i}>
-            <View style={styles.followUpQWrap}>
-              <Text style={styles.followUpQ}>{qa.question}</Text>
-            </View>
-            <View style={styles.extraAnswerWrap}>
-              <Text style={styles.extraAnswerText}>{qa.answer}</Text>
-              {qa.reaction && <Text style={styles.reactionText}>{qa.reaction}</Text>}
-            </View>
-          </View>
-        ))}
-
-        {/* 続けて会話するボタン */}
-        {answered && card.reaction && !card.showReply && (
-          <TouchableOpacity style={styles.continueBtn} onPress={() => onContinue(card.id)}>
-            <Text style={styles.continueBtnTxt}>続けて会話する</Text>
-          </TouchableOpacity>
-        )}
-
-        {/* フォローアップ質問（ローディング中） */}
-        {card.showReply && !pendingQA && (
-          <View style={styles.followUpLoadingRow}>
-            <ActivityIndicator size="small" color="#555" />
-            <Text style={styles.followUpLoadingTxt}>追加質問を考えています...</Text>
-          </View>
-        )}
-
-        {/* フォローアップ質問と選択肢 */}
-        {pendingQA && !pendingQA.answer && (
-          <View>
-            <View style={styles.followUpQWrap}>
-              <Text style={styles.followUpQ}>{pendingQA.question}</Text>
-            </View>
-            <View style={styles.choicesWrap}>
-              {pendingQA.choices.map((c) => (
-                <TouchableOpacity key={c.label} style={[styles.choiceBtn, styles.choiceBtnSub]}
-                  onPress={() => submitExtra(`${c.label}: ${c.text}`)}>
-                  <Text style={styles.choiceLabel}>{c.label}</Text>
-                  <Text style={styles.choiceText}>{c.text}</Text>
-                </TouchableOpacity>
-              ))}
-              {showExtraFree ? (
-                <View style={styles.freeInputRow}>
-                  <TextInput style={styles.freeInput} placeholder="自由に回答..." placeholderTextColor="#555"
-                    value={extraFreeText} onChangeText={setExtraFreeText} returnKeyType="done"
-                    onSubmitEditing={() => submitExtra(extraFreeText)} autoFocus />
-                  <TouchableOpacity style={[styles.freeSubmitBtn, !extraFreeText.trim() && styles.freeSubmitDisabled]}
-                    onPress={() => submitExtra(extraFreeText)} disabled={!extraFreeText.trim()}>
-                    <Text style={styles.freeSubmitTxt}>送信</Text>
-                  </TouchableOpacity>
-                </View>
-              ) : (
-                <TouchableOpacity style={styles.freeBtn} onPress={() => setShowExtraFree(true)}>
-                  <Text style={styles.freeBtnTxt}>自由に回答する...</Text>
-                </TouchableOpacity>
-              )}
-            </View>
-          </View>
-        )}
-
-        {/* 回答済みフォローアップ後に再度続けるボタン */}
-        {pendingQA?.answer && pendingQA.reaction && (
-          <TouchableOpacity style={styles.continueBtn} onPress={() => onContinue(card.id)}>
-            <Text style={styles.continueBtnTxt}>さらに会話する</Text>
-          </TouchableOpacity>
-        )}
+      {/* 回答済みフォローアップ後に再度続けるボタン */}
+      {pendingQA?.answer && pendingQA.reaction && (
+        <TouchableOpacity style={styles.continueBtn} onPress={() => onContinue(card.id)}>
+          <Text style={styles.continueBtnTxt}>さらに会話する</Text>
+        </TouchableOpacity>
+      )}
     </View>
   );
 }
@@ -1176,10 +1240,35 @@ function UsageDisplay({ stats, model }: {
   }
 
   if (model === "groq") {
+    const g = (stats as any).groq ?? {};
+    const limitTpd = g.limitTpd ?? 100000;
+    const baseRemaining = g.remainingTpd ?? (limitTpd - (g.dailyUsed ?? 0));
+    const baseAt = g.remainingTpdAt ?? 0;
+
+    // 経過時間から回復量を推定（ローリングウィンドウ: 24時間で全量回復）
+    const elapsedMs = baseAt > 0 ? now - baseAt : 0;
+    const recoveryRate = limitTpd / (24 * 60 * 60 * 1000); // トークン/ms
+    const recovered = Math.floor(elapsedMs * recoveryRate);
+    const estimatedRemaining = Math.min(limitTpd, baseRemaining + recovered);
+    const estimatedUsed = limitTpd - estimatedRemaining;
+    const pct = Math.min(100, Math.round(estimatedUsed / limitTpd * 100));
+
+    const elapsedMin = Math.floor(elapsedMs / 60000);
+    const elapsedStr = elapsedMin >= 60
+      ? Math.floor(elapsedMin / 60) + "時間" + (elapsedMin % 60) + "分前"
+      : elapsedMin > 0 ? elapsedMin + "分前" : "今";
+
     return (
       <View style={usageStyles.wrap}>
-        <Text style={usageStyles.row}>Groq</Text>
-        <Text style={usageStyles.sub}>無料</Text>
+        <Text style={usageStyles.row}>
+          {estimatedRemaining >= 1000 ? (estimatedRemaining / 1000).toFixed(1) + "k" : estimatedRemaining}
+          {" 残 / " + (limitTpd / 1000) + "k tok"}
+        </Text>
+        <Text style={usageStyles.sub}>
+          {pct >= 90 ? "⚠️ " : ""}
+          {"+" + (recovered >= 1000 ? (recovered / 1000).toFixed(1) + "k" : recovered) + " 回復"}
+          {" • 計測: " + elapsedStr}
+        </Text>
       </View>
     );
   }
@@ -1194,8 +1283,8 @@ function UsageDisplay({ stats, model }: {
 }
 const usageStyles = StyleSheet.create({
   wrap: { alignItems: "center", justifyContent: "center", paddingHorizontal: 8 },
-  row:  { color: "#333", fontSize: 11, fontWeight: "600" },
-  sub:  { color: "#2a2a2a", fontSize: 9 },
+  row: { color: "#333", fontSize: 11, fontWeight: "600" },
+  sub: { color: "#2a2a2a", fontSize: 9 },
 });
 
 // ─── AnimatedActionButton ────────────────────────────────
@@ -1212,7 +1301,7 @@ function AnimatedActionButton({ label, onPress, disabled, loading }: {
     return () => anim.stop();
   }, []);
   const borderColor = shimmer.interpolate({ inputRange: [0, 1], outputRange: ["#ffffff", "#888888"] });
-  const textColor   = shimmer.interpolate({ inputRange: [0, 1], outputRange: ["#ffffff", "#aaaaaa"] });
+  const textColor = shimmer.interpolate({ inputRange: [0, 1], outputRange: ["#ffffff", "#aaaaaa"] });
   if (loading) return <View style={styles.actionBtn}><ActivityIndicator size="small" color="#555" /></View>;
   return (
     <TouchableOpacity onPress={onPress} disabled={disabled} activeOpacity={0.7}>
@@ -1299,7 +1388,7 @@ function DragSelectTabs({ tabs, activeTab, onSelect, chatLoading }: {
       onResponderTerminate={() => setHoveredKey(null)}
     >
       {tabs.map((tab, i) => {
-        const isActive  = activeTab === tab.key;
+        const isActive = activeTab === tab.key;
         const isHovered = hoveredKey === tab.key;
         return (
           <View
@@ -1309,7 +1398,7 @@ function DragSelectTabs({ tabs, activeTab, onSelect, chatLoading }: {
             }}
             style={[
               { paddingHorizontal: 18, paddingVertical: 8, borderRadius: 20, backgroundColor: "#1a1a1a", borderWidth: 1, borderColor: "#2a2a2a" },
-              isActive  && { backgroundColor: "#fff", borderColor: "#fff" },
+              isActive && { backgroundColor: "#fff", borderColor: "#fff" },
               isHovered && !isActive && { backgroundColor: "#2a2a2a", borderColor: "#555" },
             ]}
           >
@@ -1332,56 +1421,57 @@ function DragSelectTabs({ tabs, activeTab, onSelect, chatLoading }: {
 export default function AIScreen() {
   const insets = useSafeAreaInsets();
 
-  const [activeTab,       setActiveTab]       = useState<"chat" | "feed" | "analysis">("chat");
-  const [feedCards,       setFeedCards]       = useState<FeedCard[]>([]);
-  const [entries,         setEntries]         = useState<Entry[]>([]);
-  const [myList,          setMyList]          = useState<ListItem[]>([]);
-  const [answers,         setAnswers]         = useState<string[]>([]);
-  const [generating,      setGenerating]      = useState(false);
-  const [analyses,        setAnalyses]        = useState<AnalysisRecord[]>([]);
+  const [activeTab, setActiveTab] = useState<"chat" | "feed" | "analysis">("chat");
+  const [feedCards, setFeedCards] = useState<FeedCard[]>([]);
+  const [entries, setEntries] = useState<Entry[]>([]);
+  const [myList, setMyList] = useState<ListItem[]>([]);
+  const [answers, setAnswers] = useState<string[]>([]);
+  const [generating, setGenerating] = useState(false);
+  const [analyses, setAnalyses] = useState<AnalysisRecord[]>([]);
   const [analysisLoading, setAnalysisLoading] = useState(false);
-  const [showHistory,     setShowHistory]     = useState(false);
-  const [personalContext,  setPersonalContext]  = useState<string>("");
-  const [userAiPersona,   setUserAiPersona]   = useState<string>("");
+  const [showHistory, setShowHistory] = useState(false);
+  const [personalContext, setPersonalContext] = useState<string>("");
+  const [userAiPersona, setUserAiPersona] = useState<string>("");
   // ── AI対話 state ──
-  const [chatMessages,  setChatMessages]  = useState<ChatMessage[]>([]);
-  const [chatTopic,     setChatTopic]     = useState(""); // 最初の話題入力用
-  const [chatLoading,   setChatLoading]   = useState(false);
-  const [chatPersona,   setChatPersona]   = useState<PersonaId>("contrarian");
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatTopic, setChatTopic] = useState(""); // 最初の話題入力用
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatPersona, setChatPersona] = useState<PersonaId>("normal");
   const [showPersonaPicker, setShowPersonaPicker] = useState(false);
-  const [chatStarted,   setChatStarted]   = useState(false); // 会話開始済み
-  const [chatPaused,    setChatPaused]    = useState(false); // ユーザー許可待ち
+  const [chatStarted, setChatStarted] = useState(false); // 会話開始済み
+  const [chatPaused, setChatPaused] = useState(false); // ユーザー許可待ち
   const [chatTurnCount, setChatTurnCount] = useState(0);     // 現在のターン数
-  const [aiModel,         setAiModel]         = useState("claude");
-  const [chatHistory,     setChatHistory]     = useState<ChatSession[]>([]);
-  const [chatSessionId,   setChatSessionId]   = useState<string>("");
+  const [aiModel, setAiModel] = useState("claude");
+  const [chatHistory, setChatHistory] = useState<ChatSession[]>([]);
+  const [chatSessionId, setChatSessionId] = useState<string>("");
   const [showChatHistory, setShowChatHistory] = useState(false);
   // chatToneは廃止（StyleIdに統合）
-  const [chatWaitingMsg,  setChatWaitingMsg]  = useState("");
-  const [usageStats,      setUsageStats]      = useState<{
+  const [chatWaitingMsg, setChatWaitingMsg] = useState("");
+  const [usageStats, setUsageStats] = useState<{
     gemini: { minuteRequests: number; minuteStart: number; totalRequests: number };
-    claude:  { inputTokens: number; outputTokens: number; cost: number };
-    openai:  { inputTokens: number; outputTokens: number; cost: number };
+    claude: { inputTokens: number; outputTokens: number; cost: number };
+    openai: { inputTokens: number; outputTokens: number; cost: number };
+    groq: { promptTokens: number; completionTokens: number; totalTokens: number; dailyUsed: number };
   } | null>(null);
   // この会話セッションのトークン数（mount時にリセット）
   const sessionTokensRef = React.useRef({ inputTokens: 0, outputTokens: 0 });
-  const chatScrollRef       = React.useRef<ScrollView>(null);
-  const isUserScrollingRef   = React.useRef(false);
+  const chatScrollRef = React.useRef<ScrollView>(null);
+  const isUserScrollingRef = React.useRef(false);
   const [topicGenerating, setTopicGenerating] = useState(false);
   // クロージャ問題を回避するためrefでも保持
-  const aiModelRef     = React.useRef(aiModel);
+  const aiModelRef = React.useRef(aiModel);
   const chatPersonaRef = React.useRef<StyleId>(chatPersona);
-  const abortRef       = React.useRef(false);
-  const apiKeysRef     = React.useRef<Record<string,string>>({ claude: '', gemini: '', openai: '', groq: '' });
-  const chatTopicRef   = React.useRef(chatTopic);
+  const abortRef = React.useRef(false);
+  const apiKeysRef = React.useRef<Record<string, string>>({ claude: '', gemini: '', openai: '', groq: '' });
+  const chatTopicRef = React.useRef(chatTopic);
   // apiKeyRefは常に現在のモデルに対応するキーを動的に返す
   const apiKeyRef = React.useMemo(() => ({
-    get current() { return apiKeysRef.current[aiModelRef.current as 'claude'|'gemini'|'openai'|'groq'] ?? ''; },
-    set current(_: string) {},
+    get current() { return apiKeysRef.current[aiModelRef.current as 'claude' | 'gemini' | 'openai' | 'groq'] ?? ''; },
+    set current(_: string) { },
   }), []);
-  React.useEffect(() => { aiModelRef.current     = aiModel;     }, [aiModel]);
+  React.useEffect(() => { aiModelRef.current = aiModel; }, [aiModel]);
   React.useEffect(() => { chatPersonaRef.current = chatPersona; }, [chatPersona]);
-  React.useEffect(() => { chatTopicRef.current   = chatTopic;   }, [chatTopic]);
+  React.useEffect(() => { chatTopicRef.current = chatTopic; }, [chatTopic]);
 
   // ── データ読み込み ──
   useEffect(() => {
@@ -1400,13 +1490,13 @@ export default function AIScreen() {
       AsyncStorage.getItem(APIKEY_GROQ),
       AsyncStorage.getItem("user_ai_persona"),
     ]).then(([e, m, f, a, an, pc, ch, mod, kCl, kGe, kOp, kGr, persona]) => {
-      if (e)   try { setEntries(JSON.parse(e));      } catch {}
-      if (m)   try { setMyList(JSON.parse(m));        } catch {}
-      if (f)   try { setFeedCards(JSON.parse(f));     } catch {}
-      if (a)   try { setAnswers(JSON.parse(a));       } catch {}
-      if (an)  try { setAnalyses(JSON.parse(an));     } catch {}
-      if (pc)  setPersonalContext(pc);
-      if (ch)  try { setChatHistory(JSON.parse(ch));  } catch {}
+      if (e) try { setEntries(JSON.parse(e)); } catch { }
+      if (m) try { setMyList(JSON.parse(m)); } catch { }
+      if (f) try { setFeedCards(JSON.parse(f)); } catch { }
+      if (a) try { setAnswers(JSON.parse(a)); } catch { }
+      if (an) try { setAnalyses(JSON.parse(an)); } catch { }
+      if (pc) setPersonalContext(pc);
+      if (ch) try { setChatHistory(JSON.parse(ch)); } catch { }
       if (mod) setAiModel(mod);
       apiKeysRef.current = { claude: kCl ?? "", gemini: kGe ?? "", openai: kOp ?? "", groq: kGr ?? "" };
       if (persona) setUserAiPersona(persona);
@@ -1415,20 +1505,13 @@ export default function AIScreen() {
     // ※ onMessageコールバックでリアルタイム更新するのでここはloading/error/pausedのみ
     const unsub = chatEngine.subscribe(async () => {
       const s = await chatEngine.getState();
+      // waitingMsgとloadingだけ更新。メッセージはupdateMsgに任せる
       setChatWaitingMsg(s.waitingMsg ?? "");
       setChatLoading(s.loading);
-      if (!s.loading) {
-        setChatPaused(true);
-        if (s.turnCount > 0) setChatTurnCount(s.turnCount);
-        if (s.messages.length > 0) {
-          // 完了時にcleanなメッセージで確定
-          setChatMessages(s.messages.map((m: any) => ({ ...m, streaming: false })));
-        }
-      }
       if (s.error && s.error.length > 0) {
         setChatMessages((prev: any[]) => {
           const errMsg = "エラー: " + s.error;
-          if (prev[prev.length-1]?.text === errMsg) return prev;
+          if (prev[prev.length - 1]?.text === errMsg) return prev;
           return [...prev, { role: "other", text: errMsg }];
         });
         setChatPaused(true);
@@ -1453,9 +1536,9 @@ export default function AIScreen() {
           setChatWaitingMsg(s.waitingMsg ?? "");
           if (s.topic) setChatTopic(s.topic);
           if (s.personaId) setChatPersona(s.personaId as any);
-  
+
           if (s.sessionId) setChatSessionId(s.sessionId);
-        setTimeout(() => chatScrollRef.current?.scrollToEnd({ animated: false }), 150);
+          setTimeout(() => chatScrollRef.current?.scrollToEnd({ animated: false }), 150);
         }
       });
     }, [])
@@ -1466,7 +1549,7 @@ export default function AIScreen() {
   useEffect(() => {
     const refresh = () => {
       AsyncStorage.getItem("ai_usage_stats").then((j) => {
-        if (j) try { setUsageStats(JSON.parse(j)); } catch {}
+        if (j) try { setUsageStats(JSON.parse(j)); } catch { }
       });
     };
     refresh();
@@ -1512,7 +1595,7 @@ export default function AIScreen() {
           const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Low });
           const geo = await Location.reverseGeocodeAsync(loc.coords);
           const place = geo[0];
-          const hour  = new Date().getHours();
+          const hour = new Date().getHours();
           const timeZone = hour < 5 ? "深夜" : hour < 10 ? "午前" : hour < 14 ? "昼" : hour < 18 ? "午後" : hour < 22 ? "夜" : "深夜";
           const ctx = [
             place?.city && `現在地: ${place.city}${place.region ? "（" + place.region + "）" : ""}`,
@@ -1520,7 +1603,7 @@ export default function AIScreen() {
           ].filter(Boolean).join("\n");
           setPersonalContext(ctx);
         }
-      } catch {}
+      } catch { }
     })();
   }, []);
 
@@ -1545,15 +1628,15 @@ export default function AIScreen() {
 
   // ── 回答処理 ──
   const handleAnswer = useCallback(async (cardId: string, answer: string) => {
-    const card      = feedCards.find((c) => c.id === cardId);
-    const record    = `Q: ${card?.text ?? ""} → A: ${answer}`;
+    const card = feedCards.find((c) => c.id === cardId);
+    const record = `Q: ${card?.text ?? ""} → A: ${answer}`;
     const newAnswers = [...answers, record];
     setAnswers(newAnswers);
     setFeedCards((prev) => prev.map((c) => c.id === cardId ? { ...c, answered: answer } : c));
     try {
       const reaction = await generateReaction(card?.text ?? "", answer, entries, myList, newAnswers, aiModelRef.current, apiKeyRef.current);
       setFeedCards((prev) => prev.map((c) => c.id === cardId ? { ...c, reaction } : c));
-    } catch {}
+    } catch { }
   }, [feedCards, entries, myList, answers]);
 
   // ── 続けて会話する ──
@@ -1570,7 +1653,7 @@ export default function AIScreen() {
         ? { ...c, extraQAs: [...c.extraQAs, newQA] }
         : c
       ));
-    } catch {}
+    } catch { }
   }, [feedCards, entries, myList, answers]);
 
   // ── フォローアップ回答 ──
@@ -1585,9 +1668,9 @@ export default function AIScreen() {
       return { ...c, extraQAs: newQAs, showReply: false };
     }));
     // 回答記録
-    const qa       = card.extraQAs[lastIdx];
-    const record   = `追加Q: ${qa.question} → A: ${answer}`;
-    const newAns   = [...answers, record];
+    const qa = card.extraQAs[lastIdx];
+    const record = `追加Q: ${qa.question} → A: ${answer}`;
+    const newAns = [...answers, record];
     setAnswers(newAns);
     // リアクション生成
     try {
@@ -1597,7 +1680,7 @@ export default function AIScreen() {
         const newQAs = c.extraQAs.map((q, i) => i === lastIdx ? { ...q, reaction } : q);
         return { ...c, extraQAs: newQAs };
       }));
-    } catch {}
+    } catch { }
   }, [feedCards, entries, myList, answers]);
 
   // ── スワイプでスキップ ──
@@ -1629,9 +1712,9 @@ export default function AIScreen() {
 
   // ── ユーザーの個性コンテキストを組み立て ──
   const buildUserContext = useCallback(() => {
-    const entText   = entries.filter((e) => !e.aiSuggested).map((e) => e.text).join(" / ") || "";
-    const allWorks  = myList.filter((m) => m.category !== "music");
-    const music     = myList.filter((m) => m.category === "music");
+    const entText = entries.filter((e) => !e.aiSuggested).map((e) => e.text).join(" / ") || "";
+    const allWorks = myList.filter((m) => m.category !== "music");
+    const music = myList.filter((m) => m.category === "music");
 
     // カテゴリ別に集計して突出ジャンルを抽出
     const catCount: Record<string, string[]> = {};
@@ -1648,8 +1731,8 @@ export default function AIScreen() {
     const shuffledWorks = [...allWorks].sort(() => Math.random() - 0.5).slice(0, 3);
     const shuffledMusic = [...music].sort(() => Math.random() - 0.5).slice(0, 2);
 
-    const analysis   = analyses[0]?.text?.slice(0, 300) ?? "";
-    const summary    = analyses[0]?.summary ?? "";
+    const analysis = analyses[0]?.text?.slice(0, 300) ?? "";
+    const summary = analyses[0]?.summary ?? "";
 
     return [
       entText ? `【自己紹介】${entText}` : "",
@@ -1665,56 +1748,71 @@ export default function AIScreen() {
 
   // ── ターンブロック実行（ストリーミング）──
   const runBlock = useCallback(async (startMessages: ChatMessage[], startTurn: number): Promise<ChatMessage[]> => {
-    const persona  = AI_PERSONAS.find((p) => p.id === chatPersonaRef.current) ?? AI_PERSONAS[0];
-    const userCtx  = buildUserContext();
-    const topic    = chatTopicRef.current; // 議題を常に参照
+    const persona = AI_PERSONAS.find((p) => p.id === chatPersonaRef.current) ?? AI_PERSONAS[0];
+    // MyWorldデータはあなたAIには渡さない
+    const userCtx = "";
+    const topic = chatTopicRef.current;
     let accumulated = [...startMessages];
 
     abortRef.current = false;
+    // streaming中や空テキストを除いた確定済みメッセージのみを返すヘルパー
+    const dedupeNounsChat = (history: string, topic: string): string => {
+      if (!topic || topic.length < 2) return history;
+      const escaped = topic.split("").map((c) =>
+        /[.*+?^${}()|[\]\\]/.test(c) ? "\\" + c : c
+      ).join("");
+      let count = 0;
+      return history.replace(new RegExp(escaped, "g"), () => {
+        count++;
+        return count <= 1 ? topic : "彼";
+      });
+    };
+
+    const confirmedHistoryChat = (ms: ChatMessage[], n = 4) => {
+      const seen = new Set<string>();
+      return ms
+        .filter((m) => m.role !== "topic" && !m.streaming && m.text.trim() !== "")
+        .slice(-n)
+        .filter((m) => {
+          const key = m.role + m.text.slice(0, 30);
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+        .map((m) => (m.role === "you" ? "あなたAI" : persona.label) + ": " + m.text.slice(0, 120))
+        .join(" / ") || "なし";
+    };
+
     for (let t = 0; t < TURNS_PER_BLOCK; t++) {
       if (abortRef.current) break;
 
-      const history = accumulated
-        .filter((m) => m.role !== "topic")
-        .slice(-4)
-        .map((m) => (m.role === "you" ? "あなたAI" : persona.label) + ": " + m.text)
-        .join(" / ");
+      // あなたAI用のhistoryは確定済みメッセージのみ
+      const youHistory = dedupeNounsChat(confirmedHistoryChat(accumulated), topic);
 
       // ── あなたAI（ストリーミング）──
-      const youId = "you_" + Date.now();
       const youPlaceholder: ChatMessage = { role: "you", text: "", streaming: true };
       accumulated = [...accumulated, youPlaceholder];
       setChatMessages((prev) => [...prev, youPlaceholder]);
 
-      // あなたAIのキャラ：設定優先 → なければMyWorldデータから突出した傾向で尖ったキャラを生成
-      const youCharaDef = userAiPersona
-        ? "あなたは以下の設定のキャラクターです: " + userAiPersona
-        : userCtx
-        ? "以下のデータから「最も突出した傾向」だけを抽出して尖ったキャラを作れ。平均化・丸め禁止。" +
-          "例：SF多い+哲学書 → 「実存的な問いに取り憑かれたオタク」。" +
-          "データ：" + userCtx
-        : "自然な口語で話す人物";
+      // あなたAIのキャラ：buildYouCharaDef()で一元管理
+      const youCharaDef = buildYouCharaDef(userAiPersona);
 
+      const topicInstruction = t === 0
+        ? " 【話題のきっかけ】" + topic + "（この話題から自由に広げてよい）"
+        : "";
       const youPrompt =
         youCharaDef +
-        " 【必須進行ルール：毎ターン全て含めること】" +
-        "①キーワード（**太字**）を1つ以上出す " +
-        "②トリビア・豆知識・裏話・制作秘話を1つ出す（「トリビアだと〜」「実は〜」） " +
-        "③比喩かユーモアを1つ使う（「例えると〜」） " +
-        "④「なぜそうなるか」を必ず説明する " +
-        "⑤前の発言を受けて必ず発展させる（同じ内容の言い換え禁止） " +
-        "⑥【今日の会話素材】の作品名が自然に出せる場面で絡める " +
-        " 【禁止】浅い感想のみ・説明だけ・箇条書き・長文分析 " +
-        " 【文体】口語・2〜3文程度 " +
-        " 【議題】" + topic +
-        " 【会話履歴】" + (history || "なし") +
-        " 指示: 上記の人物として1〜2文で返す。議題について自分の感覚・経験から話す。";
+        CHAT_STYLE_RULE +
+        topicInstruction +
+        "\n【会話履歴】\n" + youHistory +
+        "\nあなたAI:";
+      console.log("=== [ChatTab] youPrompt ===", youPrompt);
 
       let youText = "";
       await pseudoStream(youPrompt, aiModelRef.current, apiKeyRef.current, (_char, full) => {
         youText = full;
         setChatMessages((prev) => prev.map((m) => m.streaming ? { ...m, text: full } : m));
-      }, abortRef, 150);
+      }, abortRef, 300);
 
       const youMsg: ChatMessage = { role: "you", text: youText };
       accumulated = [...accumulated.slice(0, -1), youMsg];
@@ -1722,29 +1820,27 @@ export default function AIScreen() {
       if (abortRef.current) break;
       await new Promise((r) => setTimeout(r, 300));
 
+      // 相手AI用のhistoryはyou確定後に再取得
+      const otherHistory = dedupeNounsChat(confirmedHistoryChat(accumulated), topic);
+
       // ── 相手AI（ストリーミング）──
       const otherPlaceholder: ChatMessage = { role: "other", text: "", streaming: true };
       accumulated = [...accumulated, otherPlaceholder];
       setChatMessages((prev) => [...prev, otherPlaceholder]);
 
+      // 相手AI：buildPersonaPrompt()でキャラ語尾+共通ルール合成済み
       const otherPrompt =
         buildPersonaPrompt(chatPersonaRef.current) +
-        " 【必須進行ルール：毎ターン全て含めること】" +
-        "①キーワード（**太字**）を1つ以上出す " +
-        "②トリビア・豆知識・裏話・制作秘話を1つ出す（「トリビアとして〜」「実は〜」） " +
-        "③比喩かユーモアを1つ使う（「例えるなら〜」「まるで〜」） " +
-        "④なぜそうなるかの理由を必ず説明する " +
-        "⑤前の発言を受けて発展させる（同じ内容の言い換え・表面的な同意禁止） " +
-        " 【禁止】浅い感想・説明だけ・長文分析・同じ言い回しの繰り返し " +
-        " 【文体】口調・性格を必ず守る。2〜3文程度 " +
-        " 【議題】" + topic +
-        " 【会話履歴】" + history + " / あなたAI: " + youText;
+        (t === 0 ? "\n【話題のきっかけ】" + topic + "（この話題から自由に広げてよい）" : "") +
+        "\n【会話履歴】\n" + otherHistory +
+        "\n相手AI:";
+      console.log("=== [ChatTab] otherPrompt ===", otherPrompt);
 
       let otherText = "";
       await pseudoStream(otherPrompt, aiModelRef.current, apiKeyRef.current, (_char, full) => {
         otherText = full;
         setChatMessages((prev) => prev.map((m) => m.streaming ? { ...m, text: full } : m));
-      }, abortRef, 150);
+      }, abortRef, 300);
 
       const otherMsg: ChatMessage = { role: "other", text: otherText };
       accumulated = [...accumulated.slice(0, -1), otherMsg];
@@ -1756,28 +1852,58 @@ export default function AIScreen() {
   }, [buildUserContext]);
 
   // ── 会話を開始 ──
+  // 正規化＋具体情報取得を1回のAPI呼び出しで行う
+  const prepareTopicContext = async (raw: string): Promise<{ topic: string; topicContext: string }> => {
+    const curModel = aiModelRef.current;
+    const curKeys = { ...apiKeysRef.current };
+    const apiKey = curKeys[curModel as keyof typeof curKeys] ?? "";
+    try {
+      const prompt =
+        "以下の話題について2つのことを答えてください。" +
+        "①固有名詞（人名・作品名・地名）が正しく伝わる正式表記（1行）" +
+        "②会話のネタになる具体的な情報を箇条書きで4つ（作品名・出来事・特徴など固有名詞を含めて）" +
+        "\n形式：\n正式表記: ○○\n・〜\n・〜\n・〜\n・〜" +
+        "\n話題：" + raw;
+      const result = await pseudoStream(prompt, curModel, apiKey, () => {}, { current: false } as any, 250);
+      if (!result) return { topic: raw, topicContext: "" };
+      const lines = result.split("\n");
+      const topicLine = lines.find((l: string) => l.startsWith("正式表記:"));
+      const topic = topicLine ? topicLine.replace("正式表記:", "").trim() : raw;
+      const bullets = lines.filter((l: string) => l.startsWith("・")).join("\n");
+      const topicContext = bullets ? "\n【参考情報】\n" + bullets + "\n" : "";
+      return { topic, topicContext };
+    } catch {
+      return { topic: raw, topicContext: "" };
+    }
+  };
+
   const startChat = useCallback(async () => {
-    const topic = chatTopic.trim();
-    if (!topic || chatLoading) return;
+    const rawTopic = chatTopic.trim();
+    if (!rawTopic || chatLoading) return;
+    setChatLoading(true);
+    setChatStarted(true);
+    setChatMessages([{ role: "topic", text: "話題を準備中..." }]);
+    Keyboard.dismiss();
+
+    // 会話開始前にtopicを正規化＋情報取得（待つが必須）
+    const { topic, topicContext } = await prepareTopicContext(rawTopic);
+
     const sid = "chat_" + Date.now();
     setChatSessionId(sid);
-    setChatStarted(true);
     setChatPaused(false);
     setChatTurnCount(0);
-    setChatLoading(true);
-    Keyboard.dismiss();
 
     const topicMsg: ChatMessage = { role: "topic", text: topic };
     setChatMessages([topicMsg]);
 
-    const persona   = AI_PERSONAS.find((p) => p.id === chatPersona) ?? AI_PERSONAS[0];
+    const persona = AI_PERSONAS.find((p) => p.id === chatPersona) ?? AI_PERSONAS[0];
     const personaPr = buildPersonaPrompt(chatPersonaRef.current);
-    const curModel  = aiModelRef.current;
-    const curKeys   = { ...apiKeysRef.current };
+    const curModel = aiModelRef.current;
+    const curKeys = { ...apiKeysRef.current };
 
     console.log("[startChat] model:", curModel, "keys:", { claude: curKeys.claude?.length, gemini: curKeys.gemini?.length, openai: curKeys.openai?.length, groq: curKeys.groq?.length });
     await chatEngine.setState({
-      messages: [topicMsg], topic, started: true, paused: false,
+      messages: [topicMsg], topic, topicContext, started: true, paused: false,
       loading: true, turnCount: 0, sessionId: sid,
       personaId: chatPersona, toneId: "", error: "", waitingMsg: "",
     });
@@ -1807,24 +1933,38 @@ export default function AIScreen() {
         return [...prev, { ...msg, streaming: false }];
       });
     };
-    chatEngine.runTurns(curModel, curKeys, personaPr, TURNS_PER_BLOCK, updateMsg, buildUserContext(), userAiPersona)
-    .then(async () => {
-      const s = await chatEngine.getState();
-      const clean = s.messages.map((m: any) => ({ ...m, streaming: false }));
-      setChatMessages(clean);
-      setChatTurnCount(s.turnCount);
-      setChatPaused(true);
-      setChatLoading(false);
-      const session: ChatSession = { id: sid, topic, messages: clean, personaId: chatPersona, createdAt: Date.now() };
-      const newHistory = [session, ...chatHistory].slice(0, 20);
-      setChatHistory(newHistory);
-      await AsyncStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(newHistory));
-    }).catch((e: any) => {
-      setChatMessages((prev) => [...prev, { role: "other", text: "エラー: " + (e?.message ?? String(e)) }]);
-      setChatPaused(true);
-      setChatLoading(false);
-    });
+    chatEngine.runTurns(curModel, curKeys, personaPr, TURNS_PER_BLOCK, updateMsg, "", userAiPersona)
+      .then(async () => {
+        const s = await chatEngine.getState();
+        try { const j = await AsyncStorage.getItem("ai_usage_stats"); if (j) setUsageStats(JSON.parse(j)); } catch {}
+        if (s.error && s.error.length > 0) {
+          setChatPaused(true);
+          setChatLoading(false);
+          return;
+        }
+        const clean = s.messages.map((m: any) => ({ ...m, streaming: false }));
+        setChatMessages(clean);
+        setChatTurnCount(s.turnCount);
+        setChatPaused(true);
+        setChatLoading(false);
+        const session: ChatSession = { id: sid, topic, messages: clean, personaId: chatPersona, createdAt: Date.now() };
+        const newHistory = [session, ...chatHistory].slice(0, 20);
+        setChatHistory(newHistory);
+        await AsyncStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(newHistory));
+      }).catch((e: any) => {
+        setChatPaused(true);
+        setChatLoading(false);
+      });
   }, [chatTopic, chatLoading, chatPersona, chatHistory, buildUserContext]);
+
+  // ── 会話を終了 ──
+  const stopChat = useCallback(async () => {
+    await chatEngine.reset();
+    setChatStarted(false);
+    setChatPaused(false);
+    setChatLoading(false);
+    setChatMessages([]);
+  }, []);
 
   // ── 続きを許可 ──
   const continueChat = useCallback(async () => {
@@ -1833,8 +1973,8 @@ export default function AIScreen() {
     setChatLoading(true);
 
     const personaPr = buildPersonaPrompt(chatPersonaRef.current);
-    const curModel  = aiModelRef.current;
-    const curKeys   = { ...apiKeysRef.current };
+    const curModel = aiModelRef.current;
+    const curKeys = { ...apiKeysRef.current };
 
     await chatEngine.setState({ loading: true, paused: false, waitingMsg: "" });
 
@@ -1860,22 +2000,26 @@ export default function AIScreen() {
         return [...prev, { ...msg, streaming: false }];
       });
     };
-    chatEngine.runTurns(curModel, curKeys, personaPr, TURNS_PER_BLOCK, updateMsg2, buildUserContext(), userAiPersona)
-    .then(async () => {
-      const s = await chatEngine.getState();
-      const clean = s.messages.map((m: any) => ({ ...m, streaming: false }));
-      setChatMessages(clean);
-      setChatTurnCount(s.turnCount);
-      setChatPaused(true);
-      setChatLoading(false);
-      const updated = chatHistory.map((ses) => ses.id === chatSessionId ? { ...ses, messages: clean } : ses);
-      setChatHistory(updated);
-      await AsyncStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(updated));
-    }).catch((e: any) => {
-      setChatMessages((prev) => [...prev, { role: "other", text: "エラー: " + (e?.message ?? String(e)) }]);
-      setChatPaused(true);
-      setChatLoading(false);
-    });
+    chatEngine.runTurns(curModel, curKeys, personaPr, TURNS_PER_BLOCK, updateMsg2, "", userAiPersona)
+      .then(async () => {
+        const s = await chatEngine.getState();
+        if (s.error && s.error.length > 0) {
+          setChatPaused(true);
+          setChatLoading(false);
+          return;
+        }
+        const clean = s.messages.map((m: any) => ({ ...m, streaming: false }));
+        setChatMessages(clean);
+        setChatTurnCount(s.turnCount);
+        setChatPaused(true);
+        setChatLoading(false);
+        const updated = chatHistory.map((ses) => ses.id === chatSessionId ? { ...ses, messages: clean } : ses);
+        setChatHistory(updated);
+        await AsyncStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(updated));
+      }).catch((e: any) => {
+        setChatPaused(true);
+        setChatLoading(false);
+      });
   }, [chatLoading, chatSessionId, chatHistory, buildUserContext]);
 
 
@@ -1893,7 +2037,7 @@ export default function AIScreen() {
       .sort(() => Math.random() - 0.5).slice(0, 1).map((m) => m.title).join("、"); // 最大1件
     const entrySample = entries.filter((e) => !e.aiSuggested)
       .sort(() => Math.random() - 0.5).slice(0, 2).map((e) => e.text).join("、");
-    const types = ["もし〜だったら？形式","〜と〜どちらが好き？形式","なぜ〜が好きなの？形式","〜についてどう思う？形式","〜の場面で自分はどうする？形式","仮定の状況形式","価値観を問う形式","逆説的な問い形式"];
+    const types = ["もし〜だったら？形式", "〜と〜どちらが好き？形式", "なぜ〜が好きなの？形式", "〜についてどう思う？形式", "〜の場面で自分はどうする？形式", "仮定の状況形式", "価値観を問う形式", "逆説的な問い形式"];
     const chosenType = types[Math.floor(Math.random() * types.length)];
     const prompt = "ユーザーの情報をもとにAI同士の会話トピックを1つ生成。毎回違うテーマにする。" +
       (listSample ? "参考（使わなくてもよい）: " + listSample + "。" : "") +
@@ -1908,11 +2052,13 @@ export default function AIScreen() {
           for (let attempt = 0; attempt < 3; attempt++) {
             if (attempt > 0) await new Promise((r2) => setTimeout(r2, 3000));
             const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" + key,
-              { method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 80, thinkingConfig: { thinkingBudget: 0 } } }) });
+              {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 80, thinkingConfig: { thinkingBudget: 0 } } })
+              });
             if (r.status === 429) { if (attempt === 2) throw new Error("Gemini 429: しばらく待ってから試してください"); continue; }
             if (!r.ok) { const d = await r.json(); throw new Error("Gemini " + r.status); }
-            recordGeminiRequest().catch(() => {});
+            recordGeminiRequest().catch(() => { });
             const d = await r.json();
             return d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
           }
@@ -1926,8 +2072,10 @@ export default function AIScreen() {
           const key = apiKeyRef.current;
           if (!key) throw new Error("GroqのAPIキーが未設定です");
           const r = await fetch("https://api.groq.com/openai/v1/chat/completions",
-            { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
-              body: JSON.stringify({ model: "llama-3.3-70b-versatile", messages: [{ role: "user", content: prompt }], max_tokens: 80 }) });
+            {
+              method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
+              body: JSON.stringify({ model: "llama-3.3-70b-versatile", messages: [{ role: "user", content: prompt }], max_tokens: 80 })
+            });
           const d = await r.json();
           if (!r.ok) throw new Error("Groq " + r.status);
           return d.choices?.[0]?.message?.content?.trim() ?? "";
@@ -1947,9 +2095,8 @@ export default function AIScreen() {
   // ── 中止 ──
   const abortChat = () => {
     chatEngine.abort();
-    setChatLoading(false);
-    setChatPaused(true);
-    // 履歴windowは開かない
+    setChatLoading(false);   // UI即時更新
+    setChatWaitingMsg("");   // 待機表示クリア
   };
 
   // ── リセット（新規開始）──
@@ -1965,7 +2112,7 @@ export default function AIScreen() {
   };
 
 
-  const completed      = feedCards.filter((c) => !c.loading || c.text);
+  const completed = feedCards.filter((c) => !c.loading || c.text);
   const latestAnalysis = analyses[0];
 
   return (
@@ -2045,7 +2192,7 @@ export default function AIScreen() {
           {!chatStarted && (
             <View style={styles.chatInputAreaTop}>
               <TextInput
-                style={styles.chatInputMulti}
+                style={[styles.chatInputMulti, { color: "#fff" }]}
                 placeholder="話題を入力..."
                 placeholderTextColor="#555"
                 value={chatTopic}
@@ -2086,7 +2233,10 @@ export default function AIScreen() {
                 <View key={i} style={[styles.chatBubbleWrap, isYou ? styles.chatBubbleWrapYou : styles.chatBubbleWrapOther]}>
                   <Text style={styles.chatBubbleRole}>{isYou ? "あなたAI" : AI_PERSONAS.find((p) => p.id === chatPersona)?.label}</Text>
                   <View style={[styles.chatBubble, isYou ? styles.chatBubbleYou : styles.chatBubbleOther]}>
-                    <Text style={styles.chatBubbleText}>{msg.text}</Text>
+                    {msg.text.includes("[WAIT:")
+                      ? <CountdownMessage text={msg.text} />
+                      : <Text style={styles.chatBubbleText}>{msg.text}</Text>
+                    }
                   </View>
                 </View>
               );
@@ -2112,15 +2262,16 @@ export default function AIScreen() {
                 </TouchableOpacity>
               </View>
             )}
-            {chatStarted && chatPaused && !chatLoading && (
+
+            {chatPaused && !chatLoading && (
               <View style={styles.chatControlInner}>
                 <Text style={styles.chatTurnText}>{chatTurnCount}ターン完了</Text>
                 <View style={styles.chatControlBtns}>
-                  <TouchableOpacity style={styles.chatStopBtn} onPress={resetChat}>
+                  <TouchableOpacity style={styles.chatStopBtn} onPress={stopChat}>
                     <Text style={styles.chatStopBtnText}>終了</Text>
                   </TouchableOpacity>
                   <TouchableOpacity style={styles.chatContinueBtn} onPress={continueChat}>
-                    <Text style={styles.chatContinueBtnText}>続ける（+{TURNS_PER_BLOCK}ターン）</Text>
+                    <Text style={styles.chatContinueBtnText}>会話を続ける</Text>
                   </TouchableOpacity>
                 </View>
               </View>
@@ -2196,127 +2347,127 @@ export default function AIScreen() {
 }
 
 const styles = StyleSheet.create({
-  container:   { flex: 1, backgroundColor: "#000" },
+  container: { flex: 1, backgroundColor: "#000" },
   headerTitle: { color: "#fff", fontSize: 26, fontWeight: "700", paddingHorizontal: 20, marginBottom: 12 },
-  feedList:    { flex: 1 },
+  feedList: { flex: 1 },
   listContent: { paddingHorizontal: 16 },
-  tabBarWrap:   { borderTopWidth: 0.5, borderTopColor: "#222", paddingTop: 10, backgroundColor: "#000" },
+  tabBarWrap: { borderTopWidth: 0.5, borderTopColor: "#222", paddingTop: 10, backgroundColor: "#000" },
   tabAndBtnRow: { flexDirection: "row", alignItems: "center", paddingRight: 12 },
-  actionBtn:         { paddingHorizontal: 14, paddingVertical: 8, borderRadius: 20, borderWidth: 1.5, borderColor: "#fff", marginLeft: 8, backgroundColor: "transparent" },
+  actionBtn: { paddingHorizontal: 14, paddingVertical: 8, borderRadius: 20, borderWidth: 1.5, borderColor: "#fff", marginLeft: 8, backgroundColor: "transparent" },
   actionBtnDisabled: { borderColor: "#333", backgroundColor: "#1a1a1a" },
-  actionBtnText:     { color: "#fff", fontSize: 13, fontWeight: "700" },
-  feedCard:     { backgroundColor: "#0d0d0d", borderRadius: 16, padding: 16, marginBottom: 12, borderWidth: 1, borderColor: "#1e1e1e" },
+  actionBtnText: { color: "#fff", fontSize: 13, fontWeight: "700" },
+  feedCard: { backgroundColor: "#0d0d0d", borderRadius: 16, padding: 16, marginBottom: 12, borderWidth: 1, borderColor: "#1e1e1e" },
   feedCardText: { color: "#e0e0e0", fontSize: 15, lineHeight: 24 },
-  choicesWrap:   { marginTop: 14, gap: 8 },
-  choiceBtn:     { flexDirection: "row", alignItems: "flex-start", backgroundColor: "#1a1a1a", borderRadius: 12, padding: 12, borderWidth: 1, borderColor: "#2a2a2a", gap: 10 },
-  choiceBtnSub:  { backgroundColor: "#111", borderColor: "#222" },
-  choiceLabel:   { color: "#fff", fontWeight: "700", fontSize: 14, minWidth: 20 },
-  choiceText:    { color: "#ccc", fontSize: 14, lineHeight: 20, flex: 1 },
-  freeBtn:       { paddingVertical: 10, alignItems: "center", borderWidth: 1, borderColor: "#2a2a2a", borderRadius: 12 },
-  freeBtnTxt:    { color: "#555", fontSize: 13 },
-  freeInputRow:  { flexDirection: "row", gap: 8 },
-  freeInput:     { flex: 1, height: 40, backgroundColor: "#1a1a1a", borderRadius: 20, paddingHorizontal: 14, color: "#fff", fontSize: 14, borderWidth: 1, borderColor: "#333" },
-  freeSubmitBtn:      { height: 40, paddingHorizontal: 14, backgroundColor: "#fff", borderRadius: 20, justifyContent: "center" },
+  choicesWrap: { marginTop: 14, gap: 8 },
+  choiceBtn: { flexDirection: "row", alignItems: "flex-start", backgroundColor: "#1a1a1a", borderRadius: 12, padding: 12, borderWidth: 1, borderColor: "#2a2a2a", gap: 10 },
+  choiceBtnSub: { backgroundColor: "#111", borderColor: "#222" },
+  choiceLabel: { color: "#fff", fontWeight: "700", fontSize: 14, minWidth: 20 },
+  choiceText: { color: "#ccc", fontSize: 14, lineHeight: 20, flex: 1 },
+  freeBtn: { paddingVertical: 10, alignItems: "center", borderWidth: 1, borderColor: "#2a2a2a", borderRadius: 12 },
+  freeBtnTxt: { color: "#555", fontSize: 13 },
+  freeInputRow: { flexDirection: "row", gap: 8 },
+  freeInput: { flex: 1, height: 40, backgroundColor: "#1a1a1a", borderRadius: 20, paddingHorizontal: 14, color: "#fff", fontSize: 14, borderWidth: 1, borderColor: "#333" },
+  freeSubmitBtn: { height: 40, paddingHorizontal: 14, backgroundColor: "#fff", borderRadius: 20, justifyContent: "center" },
   freeSubmitDisabled: { backgroundColor: "#333" },
-  freeSubmitTxt:      { color: "#000", fontWeight: "700", fontSize: 13 },
-  answeredWrap:  { marginTop: 12, backgroundColor: "#111", borderRadius: 10, padding: 12, borderLeftWidth: 2, borderLeftColor: "#333" },
+  freeSubmitTxt: { color: "#000", fontWeight: "700", fontSize: 13 },
+  answeredWrap: { marginTop: 12, backgroundColor: "#111", borderRadius: 10, padding: 12, borderLeftWidth: 2, borderLeftColor: "#333" },
   answeredLabel: { color: "#555", fontSize: 11, marginBottom: 4 },
-  answeredText:  { color: "#fff", fontSize: 14, marginBottom: 8 },
-  reactionText:  { color: "#aaa", fontSize: 13, lineHeight: 20, fontStyle: "italic" },
-  followUpQWrap:      { marginTop: 14, backgroundColor: "#0a0a0a", borderRadius: 10, padding: 12, borderLeftWidth: 2, borderLeftColor: "#555" },
-  followUpQ:          { color: "#ddd", fontSize: 14, lineHeight: 22 },
+  answeredText: { color: "#fff", fontSize: 14, marginBottom: 8 },
+  reactionText: { color: "#aaa", fontSize: 13, lineHeight: 20, fontStyle: "italic" },
+  followUpQWrap: { marginTop: 14, backgroundColor: "#0a0a0a", borderRadius: 10, padding: 12, borderLeftWidth: 2, borderLeftColor: "#555" },
+  followUpQ: { color: "#ddd", fontSize: 14, lineHeight: 22 },
   followUpLoadingRow: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 12, paddingVertical: 8 },
   followUpLoadingTxt: { color: "#555", fontSize: 13 },
-  extraAnswerWrap:    { marginTop: 8, backgroundColor: "#111", borderRadius: 10, padding: 12, borderLeftWidth: 2, borderLeftColor: "#2a2a2a" },
-  extraAnswerText:    { color: "#fff", fontSize: 14, marginBottom: 6 },
-  continueBtn:    { marginTop: 12, paddingVertical: 10, alignItems: "center", borderWidth: 1, borderColor: "#333", borderRadius: 10 },
+  extraAnswerWrap: { marginTop: 8, backgroundColor: "#111", borderRadius: 10, padding: 12, borderLeftWidth: 2, borderLeftColor: "#2a2a2a" },
+  extraAnswerText: { color: "#fff", fontSize: 14, marginBottom: 6 },
+  continueBtn: { marginTop: 12, paddingVertical: 10, alignItems: "center", borderWidth: 1, borderColor: "#333", borderRadius: 10 },
   continueBtnTxt: { color: "#666", fontSize: 13 },
   noticeCard: { backgroundColor: "#111", borderRadius: 12, padding: 14, marginBottom: 16, borderWidth: 1, borderColor: "#2a2a2a" },
   noticeText: { color: "#666", fontSize: 13, textAlign: "center" },
-  summaryCard:  { backgroundColor: "#1a0a00", borderRadius: 14, padding: 16, marginBottom: 10, borderWidth: 1, borderColor: "#8B2500" },
-  summaryDate:  { color: "#8B2500", fontSize: 11, marginBottom: 6 },
-  summaryText:  { color: "#ff6b35", fontSize: 20, fontWeight: "700", lineHeight: 28 },
+  summaryCard: { backgroundColor: "#1a0a00", borderRadius: 14, padding: 16, marginBottom: 10, borderWidth: 1, borderColor: "#8B2500" },
+  summaryDate: { color: "#8B2500", fontSize: 11, marginBottom: 6 },
+  summaryText: { color: "#ff6b35", fontSize: 20, fontWeight: "700", lineHeight: 28 },
   analysisCard: { backgroundColor: "#0d0d0d", borderRadius: 16, padding: 20, borderWidth: 1, borderColor: "#222", marginBottom: 4 },
   analysisText: { color: "#e0e0e0", fontSize: 15, lineHeight: 28 },
   emptyState: { paddingTop: 40, alignItems: "center", gap: 12, paddingHorizontal: 16 },
-  usageInline:     { paddingHorizontal: 6, paddingVertical: 4 },
+  usageInline: { paddingHorizontal: 6, paddingVertical: 4 },
   usageInlineText: { color: "#333", fontSize: 10 },
-  usageCard:     { backgroundColor: "#0a0a0a", borderRadius: 12, padding: 10, borderWidth: 1, borderColor: "#1a1a1a", minWidth: 80 },
-  usageCardTitle:{ color: "#333", fontSize: 9, fontWeight: "600", letterSpacing: 0.5, marginBottom: 4 },
-  usageCardRow:  { color: "#2a2a2a", fontSize: 10, lineHeight: 15 },
+  usageCard: { backgroundColor: "#0a0a0a", borderRadius: 12, padding: 10, borderWidth: 1, borderColor: "#1a1a1a", minWidth: 80 },
+  usageCardTitle: { color: "#333", fontSize: 9, fontWeight: "600", letterSpacing: 0.5, marginBottom: 4 },
+  usageCardRow: { color: "#2a2a2a", fontSize: 10, lineHeight: 15 },
   emptyTitle: { color: "#fff", fontSize: 18, fontWeight: "700" },
-  emptyText:  { color: "#444", fontSize: 14, textAlign: "center", lineHeight: 24 },
-  personaBar:       { flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: 0.5, borderBottomColor: "#1e1e1e", backgroundColor: "#0a0a0a" },
-  personaBarLabel:  { color: "#555", fontSize: 12 },
-  personaBarName:   { color: "#fff", fontSize: 12, fontWeight: "700" },
-  personaBarChevron:{ color: "#555", fontSize: 11, marginLeft: 4 },
-  personaPickerWrap:{ backgroundColor: "#0d0d0d", borderBottomWidth: 0.5, borderBottomColor: "#1e1e1e", paddingVertical: 10 },
+  emptyText: { color: "#444", fontSize: 14, textAlign: "center", lineHeight: 24 },
+  personaBar: { flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: 0.5, borderBottomColor: "#1e1e1e", backgroundColor: "#0a0a0a" },
+  personaBarLabel: { color: "#555", fontSize: 12 },
+  personaBarName: { color: "#fff", fontSize: 12, fontWeight: "700" },
+  personaBarChevron: { color: "#555", fontSize: 11, marginLeft: 4 },
+  personaPickerWrap: { backgroundColor: "#0d0d0d", borderBottomWidth: 0.5, borderBottomColor: "#1e1e1e", paddingVertical: 10 },
   personaPickerSection: { color: "#444", fontSize: 10, fontWeight: "700", letterSpacing: 0.8, paddingHorizontal: 14, paddingBottom: 6 },
-  personaPickerDesc:    { color: "#333", fontSize: 11, paddingHorizontal: 14, paddingTop: 8, lineHeight: 16 },
-  personaChip:          { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 14, backgroundColor: "#111", borderWidth: 1, borderColor: "#2a2a2a" },
-  personaChipActive:    { backgroundColor: "#1a1a1a", borderColor: "#888" },
-  personaChipToneActive:{ backgroundColor: "#0a1628", borderColor: "#1a3a6a" },
-  personaChipText:      { color: "#666", fontSize: 13 },
-  personaGridHeader:         { flexDirection: "row", borderBottomWidth: 0.5, borderBottomColor: "#1a1a1a", paddingVertical: 6 },
-  personaGridHeaderCell:     { flex: 1, alignItems: "center", justifyContent: "center" },
-  personaGridRoleLabel:      { color: "#444", fontSize: 10, textAlign: "center" },
-  personaGridRoleLabelActive:{ color: "#fff", fontWeight: "700" },
-  personaGridRow:            { flexDirection: "row", borderBottomWidth: 0.5, borderBottomColor: "#111" },
-  personaGridToneCell:       { flex: 1, alignItems: "center", justifyContent: "center", paddingVertical: 10 },
-  personaGridToneLabel:      { color: "#444", fontSize: 11 },
-  personaGridToneLabelActive:{ color: "#7eb8ff", fontWeight: "700" },
-  personaGridCell:           { flex: 1, alignItems: "center", justifyContent: "center", paddingVertical: 10 },
-  personaGridCellActive:     { backgroundColor: "#0d1a2e", borderRadius: 6, margin: 2 },
-  personaGridCellCheck:      { color: "#7eb8ff", fontSize: 14, fontWeight: "700" },
-  personaGridDesc:           { padding: 12, borderTopWidth: 0.5, borderTopColor: "#1a1a1a" },
-  personaGridDescText:       { color: "#444", fontSize: 11, lineHeight: 16 },
-  chatTopArea:       { borderBottomWidth: 0.5, borderBottomColor: "#1e1e1e", backgroundColor: "#000" },
-  chatTopInputRow:   { flexDirection: "row", alignItems: "flex-end", gap: 8, paddingHorizontal: 12, paddingTop: 10, paddingBottom: 6 },
-  chatInputAreaTop:  { paddingHorizontal: 12, paddingVertical: 8, borderBottomWidth: 0.5, borderBottomColor: "#1e1e1e" },
+  personaPickerDesc: { color: "#333", fontSize: 11, paddingHorizontal: 14, paddingTop: 8, lineHeight: 16 },
+  personaChip: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 14, backgroundColor: "#111", borderWidth: 1, borderColor: "#2a2a2a" },
+  personaChipActive: { backgroundColor: "#1a1a1a", borderColor: "#888" },
+  personaChipToneActive: { backgroundColor: "#0a1628", borderColor: "#1a3a6a" },
+  personaChipText: { color: "#666", fontSize: 13 },
+  personaGridHeader: { flexDirection: "row", borderBottomWidth: 0.5, borderBottomColor: "#1a1a1a", paddingVertical: 6 },
+  personaGridHeaderCell: { flex: 1, alignItems: "center", justifyContent: "center" },
+  personaGridRoleLabel: { color: "#444", fontSize: 10, textAlign: "center" },
+  personaGridRoleLabelActive: { color: "#fff", fontWeight: "700" },
+  personaGridRow: { flexDirection: "row", borderBottomWidth: 0.5, borderBottomColor: "#111" },
+  personaGridToneCell: { flex: 1, alignItems: "center", justifyContent: "center", paddingVertical: 10 },
+  personaGridToneLabel: { color: "#444", fontSize: 11 },
+  personaGridToneLabelActive: { color: "#7eb8ff", fontWeight: "700" },
+  personaGridCell: { flex: 1, alignItems: "center", justifyContent: "center", paddingVertical: 10 },
+  personaGridCellActive: { backgroundColor: "#0d1a2e", borderRadius: 6, margin: 2 },
+  personaGridCellCheck: { color: "#7eb8ff", fontSize: 14, fontWeight: "700" },
+  personaGridDesc: { padding: 12, borderTopWidth: 0.5, borderTopColor: "#1a1a1a" },
+  personaGridDescText: { color: "#444", fontSize: 11, lineHeight: 16 },
+  chatTopArea: { borderBottomWidth: 0.5, borderBottomColor: "#1e1e1e", backgroundColor: "#000" },
+  chatTopInputRow: { flexDirection: "row", alignItems: "flex-end", gap: 8, paddingHorizontal: 12, paddingTop: 10, paddingBottom: 6 },
+  chatInputAreaTop: { paddingHorizontal: 12, paddingVertical: 8, borderBottomWidth: 0.5, borderBottomColor: "#1e1e1e" },
   chatBottomActions: { flexDirection: "row", gap: 8, padding: 10, justifyContent: "flex-end", borderBottomWidth: 0.5, borderBottomColor: "#1e1e1e" },
-  chatLog:          { padding: 16, gap: 20, paddingBottom: 24 },
-  chatEmpty:        { paddingTop: 60, alignItems: "center" },
-  chatEmptyText:    { color: "#333", fontSize: 14, textAlign: "center", lineHeight: 24 },
-  chatBubbleWrap:     { gap: 4 },
-  chatBubbleWrapYou:  { alignItems: "flex-end" },
-  chatBubbleWrapOther:{ alignItems: "flex-start" },
-  chatBubbleRole:   { color: "#3a5a7a", fontSize: 10, paddingHorizontal: 6, marginBottom: 2, fontWeight: "600" },
-  chatBubble:       { maxWidth: "85%", borderRadius: 18, padding: 14, flexShrink: 1 },
-  chatBubbleYou:    { backgroundColor: "#1a2a4a", borderWidth: 0 },
-  chatBubbleOther:  { backgroundColor: "#1e1e1e", borderWidth: 0 },
-  chatBubbleText:   { color: "#e8e8e8", fontSize: 15, lineHeight: 24, flexShrink: 1 },
-  chatInputWrap:    { flexDirection: "row", gap: 8, padding: 10, borderBottomWidth: 0.5, borderBottomColor: "#1e1e1e", backgroundColor: "#000" },
-  chatInputMulti:   { backgroundColor: "#111", borderRadius: 12, paddingHorizontal: 14, paddingVertical: 10, color: "#fff", fontSize: 14, borderWidth: 1, borderColor: "#2a2a2a", maxHeight: 120, minHeight: 44 },
-  chatInput:        { flex: 1, height: 40, backgroundColor: "#111", borderRadius: 20, paddingHorizontal: 14, color: "#fff", fontSize: 14, borderWidth: 1, borderColor: "#2a2a2a" },
-  chatSendBtn:          { height: 40, paddingHorizontal: 16, backgroundColor: "#fff", borderRadius: 20, justifyContent: "center" },
-  chatSendBtnDisabled:  { backgroundColor: "#1a1a1a" },
-  chatSendBtnText:      { color: "#000", fontWeight: "700", fontSize: 13 },
-  chatRandBtn:     { paddingHorizontal: 10, height: 40, borderRadius: 10, backgroundColor: "#0a1628", borderWidth: 1, borderColor: "#1a3a6a", alignItems: "center", justifyContent: "center" },
+  chatLog: { padding: 16, gap: 20, paddingBottom: 24 },
+  chatEmpty: { paddingTop: 60, alignItems: "center" },
+  chatEmptyText: { color: "#333", fontSize: 14, textAlign: "center", lineHeight: 24 },
+  chatBubbleWrap: { gap: 4 },
+  chatBubbleWrapYou: { alignItems: "flex-end" },
+  chatBubbleWrapOther: { alignItems: "flex-start" },
+  chatBubbleRole: { color: "#3a5a7a", fontSize: 10, paddingHorizontal: 6, marginBottom: 2, fontWeight: "600" },
+  chatBubble: { maxWidth: "85%", borderRadius: 18, padding: 14, flexShrink: 1 },
+  chatBubbleYou: { backgroundColor: "#1a2a4a", borderWidth: 0 },
+  chatBubbleOther: { backgroundColor: "#1e1e1e", borderWidth: 0 },
+  chatBubbleText: { color: "#e8e8e8", fontSize: 15, lineHeight: 24, flexShrink: 1 },
+  chatInputWrap: { flexDirection: "row", gap: 8, padding: 10, borderBottomWidth: 0.5, borderBottomColor: "#1e1e1e", backgroundColor: "#000" },
+  chatInputMulti: { backgroundColor: "#111", borderRadius: 12, paddingHorizontal: 14, paddingVertical: 10, color: "#fff", fontSize: 14, borderWidth: 1, borderColor: "#2a2a2a", maxHeight: 120, minHeight: 44 },
+  chatInput: { flex: 1, height: 40, backgroundColor: "#111", borderRadius: 20, paddingHorizontal: 14, color: "#fff", fontSize: 14, borderWidth: 1, borderColor: "#2a2a2a" },
+  chatSendBtn: { height: 40, paddingHorizontal: 16, backgroundColor: "#fff", borderRadius: 20, justifyContent: "center" },
+  chatSendBtnDisabled: { backgroundColor: "#1a1a1a" },
+  chatSendBtnText: { color: "#000", fontWeight: "700", fontSize: 13 },
+  chatRandBtn: { paddingHorizontal: 10, height: 40, borderRadius: 10, backgroundColor: "#0a1628", borderWidth: 1, borderColor: "#1a3a6a", alignItems: "center", justifyContent: "center" },
   chatRandBtnText: { fontSize: 11, color: "#7eb8ff", fontWeight: "600" },
-  chatAbortBtn:     { paddingHorizontal: 12, paddingVertical: 4, borderRadius: 10, borderWidth: 1, borderColor: "#5a1a1a", backgroundColor: "#1a0000" },
+  chatAbortBtn: { paddingHorizontal: 12, paddingVertical: 4, borderRadius: 10, borderWidth: 1, borderColor: "#5a1a1a", backgroundColor: "#1a0000" },
   chatAbortBtnText: { color: "#ff4444", fontSize: 12, fontWeight: "600" },
-  chatResetBtn:     { paddingHorizontal: 12, paddingVertical: 4 },
+  chatResetBtn: { paddingHorizontal: 12, paddingVertical: 4 },
   chatResetBtnText: { color: "#444", fontSize: 12 },
-  chatHistoryBtn:      { paddingHorizontal: 10, paddingVertical: 4 },
-  chatHistoryBtnText:  { color: "#3a6ea8", fontSize: 12 },
-  chatHistoryPanel:    { backgroundColor: "#060e1a", borderBottomWidth: 0.5, borderBottomColor: "#0d1a2e" },
-  chatHistoryHeader:   { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 12, paddingVertical: 8 },
-  chatHistoryTitle:    { color: "#3a6ea8", fontSize: 11, fontWeight: "700" },
-  chatHistoryEmpty:    { color: "#333", fontSize: 12, padding: 12 },
-  chatHistoryItem:     { paddingHorizontal: 14, paddingVertical: 10, borderTopWidth: 0.5, borderTopColor: "#0d1a2e" },
-  chatHistoryItemTopic:{ color: "#7eb8ff", fontSize: 13, marginBottom: 2 },
+  chatHistoryBtn: { paddingHorizontal: 10, paddingVertical: 4 },
+  chatHistoryBtnText: { color: "#3a6ea8", fontSize: 12 },
+  chatHistoryPanel: { backgroundColor: "#060e1a", borderBottomWidth: 0.5, borderBottomColor: "#0d1a2e" },
+  chatHistoryHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 12, paddingVertical: 8 },
+  chatHistoryTitle: { color: "#3a6ea8", fontSize: 11, fontWeight: "700" },
+  chatHistoryEmpty: { color: "#333", fontSize: 12, padding: 12 },
+  chatHistoryItem: { paddingHorizontal: 14, paddingVertical: 10, borderTopWidth: 0.5, borderTopColor: "#0d1a2e" },
+  chatHistoryItemTopic: { color: "#7eb8ff", fontSize: 13, marginBottom: 2 },
   chatHistoryItemMeta: { color: "#2a4a6a", fontSize: 11 },
   chatTopicBadge: { alignSelf: "center", backgroundColor: "#111", borderRadius: 16, paddingHorizontal: 16, paddingVertical: 6, marginVertical: 8, borderWidth: 1, borderColor: "#2a2a2a" },
-  chatTopicText:  { color: "#555", fontSize: 12, textAlign: "center", flexShrink: 1 },
-  chatBottomWrap:   { borderTopWidth: 0.5, borderTopColor: "#1e1e1e", backgroundColor: "#000" },
+  chatTopicText: { color: "#555", fontSize: 12, textAlign: "center", flexShrink: 1 },
+  chatBottomWrap: { borderTopWidth: 0.5, borderTopColor: "#1e1e1e", backgroundColor: "#000" },
   chatControlInner: { padding: 14 },
-  chatTurnText:    { color: "#444", fontSize: 11, textAlign: "center", marginBottom: 10 },
+  chatTurnText: { color: "#444", fontSize: 11, textAlign: "center", marginBottom: 10 },
   chatControlBtns: { flexDirection: "row", gap: 10 },
-  chatStopBtn:      { flex: 1, paddingVertical: 12, borderRadius: 12, borderWidth: 1, borderColor: "#333", alignItems: "center" },
-  chatStopBtnText:  { color: "#555", fontSize: 14, fontWeight: "600" },
-  chatContinueBtn:  { flex: 2, paddingVertical: 12, borderRadius: 12, backgroundColor: "#fff", alignItems: "center" },
+  chatStopBtn: { flex: 1, paddingVertical: 12, borderRadius: 12, borderWidth: 1, borderColor: "#333", alignItems: "center" },
+  chatStopBtnText: { color: "#555", fontSize: 14, fontWeight: "600" },
+  chatContinueBtn: { flex: 2, paddingVertical: 12, borderRadius: 12, backgroundColor: "#fff", alignItems: "center" },
   chatContinueBtnText: { color: "#000", fontSize: 14, fontWeight: "700" },
   chatInProgressBar: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", backgroundColor: "#0a1020", paddingHorizontal: 14, paddingVertical: 6, borderTopWidth: 0.5, borderTopColor: "#1a3a6a" },
-  chatInProgressText:{ color: "#3a6ea8", fontSize: 12 },
-  chatInProgressLink:{ color: "#7eb8ff", fontSize: 12, fontWeight: "600" },
+  chatInProgressText: { color: "#3a6ea8", fontSize: 12 },
+  chatInProgressLink: { color: "#7eb8ff", fontSize: 12, fontWeight: "600" },
 });

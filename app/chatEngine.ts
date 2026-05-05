@@ -2,6 +2,7 @@
 // _layout.tsxでインスタンス化し、ai.tsxはAsyncStorageで状態を参照する
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { CHAT_STYLE_RULE, buildYouCharaDef } from "../lib/prompts";
 
 export const CHAT_STATE_KEY = "chat_engine_state";
 export const CHAT_PARTIAL_KEY = "chat_engine_partial";
@@ -15,6 +16,7 @@ export interface EngineMessage {
 export interface ChatEngineState {
   messages: EngineMessage[];
   topic: string;
+  topicContext: string;
   started: boolean;
   paused: boolean;
   loading: boolean;
@@ -29,6 +31,7 @@ export interface ChatEngineState {
 const defaultState = (): ChatEngineState => ({
   messages: [],
   topic: "",
+  topicContext: "",
   started: false,
   paused: false,
   loading: false,
@@ -45,6 +48,7 @@ class ChatEngine {
   private aborted = false;
   private running = false;
   private listeners: (() => void)[] = [];
+  private waitingListeners: ((msg: string) => void)[] = [];
 
   // 外部から状態変化を購読できるようにする
   subscribe(fn: () => void): () => void {
@@ -52,6 +56,16 @@ class ChatEngine {
     return () => {
       this.listeners = this.listeners.filter((f) => f !== fn);
     };
+  }
+
+  // waitingMsg専用：AsyncStorage不使用でリアルタイム通知
+  subscribeWaiting(fn: (msg: string) => void): () => void {
+    this.waitingListeners.push(fn);
+    return () => { this.waitingListeners = this.waitingListeners.filter((f) => f !== fn); };
+  }
+
+  notifyWaiting(msg: string) {
+    this.waitingListeners.forEach((f) => f(msg));
   }
 
   private notify() {
@@ -224,7 +238,18 @@ class ChatEngine {
           body: JSON.stringify({ model: "llama-3.3-70b-versatile", messages: [{ role: "user", content: prompt }], max_tokens: maxTokens }),
         });
         const d = await res.json();
-        if (!res.ok) throw new Error("Groq " + res.status + ": " + (d.error?.message ?? ""));
+        if (!res.ok) {
+          const rawMsg = d.error?.message ?? "";
+          console.log("[Groq] error raw response:", JSON.stringify(d));
+          console.log("[Groq] rawMsg:", rawMsg);
+          const jaMsg =
+            res.status === 429 ? "レート制限またはトークン上限に達しました。しばらく待ってから再試行してください。" :
+            res.status === 401 ? "APIキーが無効です。設定を確認してください。" :
+            res.status === 403 ? "アクセスが拒否されました。" :
+            res.status === 500 ? "Groqサーバーエラーです。しばらく待ってから再試行してください。" :
+            "不明なエラーが発生しました。";
+          throw new Error("Groq " + res.status + "\n" + rawMsg + "\n\n" + jaMsg);
+        }
         return d.choices?.[0]?.message?.content?.trim() ?? "";
       }
 
@@ -257,78 +282,65 @@ class ChatEngine {
       let currentState = await this.getState();
       let msgs = [...(currentState.messages ?? [])];
 
-      const variations = [
-        "今回は質問で返す。",
-        "今回は具体的な例を出す。",
-        "今回は相手の言葉を引用してから切り込む。",
-        "今回は予想外の角度から返す。",
-        "今回は短く断言する。",
-        "今回は少し感情的に返す。",
-        "今回は逆説的な視点を出す。",
-        "今回は相手の前提を疑う。",
-      ];
+      // streaming中や空テキストを除いた確定済みメッセージのみを返すヘルパー
+      const dedupeNouns = (history: string, topic: string): string => {
+        if (!topic || topic.length < 2) return history;
+        const escaped = topic.split("").map((c) =>
+          /[.*+?^${}()|[\]\\]/.test(c) ? "\\" + c : c
+        ).join("");
+        let count = 0;
+        return history.replace(new RegExp(escaped, "g"), () => {
+          count++;
+          return count <= 1 ? topic : "彼";
+        });
+      };
+
+      const confirmedHistory = (ms: EngineMessage[], n = 4) => {
+        const seen = new Set<string>();
+        return ms
+          .filter((m) => m.role !== "topic" && !m.streaming && m.text.trim() !== "")
+          .slice(-n)
+          .filter((m) => {
+            const key = m.role + m.text.slice(0, 30);
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          })
+          .map((m) => (m.role === "you" ? "あなたAI" : "相手AI") + ": " + m.text.slice(0, 120))
+          .join("\n") || "なし";
+      };
 
       for (let t = 0; t < turns; t++) {
         if (this.aborted) break;
         currentState = await this.getState();
-        const history =
-          msgs
-            .filter((m) => m.role !== "topic")
-            .slice(-4)
-            .map(
-              (m) => (m.role === "you" ? "あなたAI" : "相手AI") + ": " + m.text,
-            )
-            .join(" / ") || "なし";
 
-        const variation =
-          variations[Math.floor(Math.random() * variations.length)];
-
-        // あなたAI
         const topicText =
           currentState.topic ||
           msgs.find((m) => m.role === "topic")?.text ||
           "";
-        // あなたAIの口調：設定 > index/myworldデータから推定 の優先順位
-        const youPersonaBase = userPersona
-          ? "あなたは以下の設定のキャラクターです: " + userPersona + " "
-          : userContext
-          ? "あなたはこのユーザーです。" + userContext + " このユーザーになりきって自然に話してください。"
-          : "あなたは自然な口語で話す人物です。";
-        // キャラ定義：設定優先→MyWorldデータから突出した傾向で尖ったキャラ
-        const youCharaDef = userPersona
-          ? "あなたは以下の設定のキャラクターです: " + userPersona
-          : userContext
-          ? "以下のデータから「最も突出した傾向」だけを抽出して尖ったキャラを作れ。平均化・丸め禁止。" +
-            "例：SF多い+哲学書 → 「実存的な問いに取り憑かれたオタク」として話す。" +
-            "データ：" + userContext
-          : "自然な口語で話す人物";
+
+        const topicContext = currentState.topicContext ?? "";
+        const topicInstruction = t === 0
+          ? "\n【話題のきっかけ】" + topicText + topicContext
+          : "";
+
+        // 履歴を交互発言形式で構築（重複なし）
+        const historyLines = dedupeNouns(confirmedHistory(msgs), topicText);
 
         const youPrompt =
-          youCharaDef +
-          " 【必須：毎ターン以下を全て含める】" +
-          "①議題のキーワードを**太字**で1つ明示する " +
-          "②そのキーワードに関するトリビア・豆知識・裏話・制作秘話を1つ出す " +
-          "③比喩かユーモアを1つ使う（例えると〜） " +
-          "④なぜそうなるかの理由を説明する " +
-          "⑤前の発言を受けて新しい切り口で発展させる（言い換え・同意だけ禁止） " +
-          " 【禁止】他作品の無理な引用・浅い感想・箇条書き・長文分析 " +
-          " 【文体】口語。100〜150文字程度。 " +
-          " 【議題】" + topicText +
-          " 【会話履歴】" + history;
+          buildYouCharaDef(userPersona, userContext) +
+          CHAT_STYLE_RULE +
+          topicInstruction +
+          "\n【会話履歴】\n" + historyLines +
+          "\nあなたAI:";  // 次はあなたAIの番と明示
 
-        const youPlaceholder: EngineMessage = {
-          role: "you",
-          text: "",
-          streaming: true,
-        };
+        const youPlaceholder: EngineMessage = { role: "you", text: "", streaming: true };
         msgs = [...msgs, youPlaceholder];
         onMessage(youPlaceholder);
 
-        console.log('[ENGINE] userPersona:', userPersona?.slice(0,50), 'userContext:', userContext?.slice(0,50));
-        console.log('[ENGINE] youPrompt first 300:', youPrompt.slice(0, 300));
-        const youText = await callModel(youPrompt, 150);
+        console.log("=== [ChatEngine] youPrompt ===", youPrompt);
+        const youText = await callModel(youPrompt, 300);
         if (this.aborted) break;
-        // 疑似ストリーミング
         let youStreamed = "";
         for (const ch of youText) {
           if (this.aborted) break;
@@ -342,26 +354,14 @@ class ChatEngine {
         onMessage(youMsg);
         await new Promise((r) => setTimeout(r, 300));
 
-        // 相手AI
+        // 相手AI：you確定後に履歴を再構築、次は相手AIの番と明示
+        const otherHistoryLines = dedupeNouns(confirmedHistory(msgs), topicText);
+
         const otherPrompt =
           personaPrompt +
-          " 【必須：毎ターン以下を全て含める】" +
-          "①議題のキーワードを**太字**で1つ明示する " +
-          "②そのキーワードに関するトリビア・豆知識・裏話・制作秘話を1つ出す " +
-          "③比喩かユーモアを1つ使う（例えるなら〜） " +
-          "④なぜそうなるかの理由を説明する " +
-          "⑤前の発言を受けて新しい切り口で発展させる（言い換え・同意だけ禁止） " +
-          " 【禁止】他作品の無理な引用・浅い感想・長文分析 " +
-          " 【文体】口調・性格を必ず守る。100〜150文字程度。 " +
-          " 【議題】" +
-          topicText +
-          " 【会話履歴】" +
-          history +
-          " / あなたAI: " +
-          youText +
-          " " +
-          variation +
-          " 1〜2文。";
+          topicInstruction +
+          "\n【会話履歴】\n" + otherHistoryLines +
+          "\n相手AI:";  // 次は相手AIの番と明示
 
         const otherPlaceholder: EngineMessage = {
           role: "other",
@@ -372,7 +372,8 @@ class ChatEngine {
         await this.setState({ messages: msgs });
         onMessage(otherPlaceholder);
 
-        const otherText = await callModel(otherPrompt, 150);
+        console.log("=== [ChatEngine] otherPrompt ===", otherPrompt);
+        const otherText = await callModel(otherPrompt, 300);
         if (this.aborted) break;
         // 疑似ストリーミング
         let otherStreamed = "";
@@ -399,10 +400,12 @@ class ChatEngine {
         error: "",
       });
     } catch (e: any) {
+      const errMsg = e?.message ?? "エラーが発生しました";
+      try { onMessage({ role: "other", text: errMsg }); } catch {}
       await this.setState({
         loading: false,
         paused: true,
-        error: e?.message ?? "エラーが発生しました",
+        error: errMsg,
         waitingMsg: "",
       });
     }
