@@ -14,7 +14,8 @@
  */
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { AI_STYLES, buildPersonaPrompt, CHAT_STYLE_RULE, buildYouCharaDef } from "../lib/prompts";
+import { AI_STYLES, buildDepthPrompt, buildPersonaPrompt, CHAT_STYLE_RULE, buildYouCharaDef } from "../lib/prompts";
+import { buildUnknownTopicContext, resolveTopicFromWikipedia, resolveTopicLocally } from "../lib/topicResolver";
 
 // ─── Chat Engine（インライン）────────────────────────────
 // chatEngine.ts — タブをまたいで動き続ける会話エンジン
@@ -32,6 +33,7 @@ interface EngineMessage {
 interface ChatEngineState {
   messages: EngineMessage[];
   topic: string;
+  topicContext: string;
   started: boolean;
   paused: boolean;
   loading: boolean;
@@ -44,7 +46,7 @@ interface ChatEngineState {
 }
 
 const defaultState = (): ChatEngineState => ({
-  messages: [], topic: "", started: false, paused: false,
+  messages: [], topic: "", topicContext: "", started: false, paused: false,
   loading: false, turnCount: 0, sessionId: "",
   personaId: "contrarian", toneId: "normal", error: "", waitingMsg: "",
 });
@@ -95,7 +97,7 @@ class ChatEngine {
   async runTurns(
     model: string,
     apiKeys: Record<string, string>,
-    personaPrompt: string,
+    personaPrompt: string | (() => string),
     turns: number,
     onMessage: (msg: EngineMessage) => void,
     userContext: string = "",
@@ -103,7 +105,8 @@ class ChatEngine {
   ): Promise<void> {
     this.running = true;
     this.aborted = false;
-    console.log("[ChatEngine] runTurns start", { model, turns, personaPrompt: personaPrompt.slice(0, 50) });
+    const personaPromptPreview = typeof personaPrompt === "function" ? "[dynamic persona prompt]" : personaPrompt.slice(0, 50);
+    console.log("[ChatEngine] runTurns start", { model, turns, personaPrompt: personaPromptPreview });
     const state = await this.getState();
     await this.setState({ loading: true, paused: false, error: "", waitingMsg: "" });
 
@@ -272,6 +275,8 @@ class ChatEngine {
     const initState = await this.getState();
     console.log('[ENGINE] userPersona:', userPersona?.slice(0, 50), 'ctx:', userContext?.slice(0, 60));
     const topicText = initState.topic || initState.messages?.find((m: any) => m.role === "topic")?.text || "";
+    const topicContext = initState.topicContext || "";
+    const baseTurnCount = initState.turnCount ?? 0;
     console.log("[ChatEngine] topic:", topicText, "msgs:", initState.messages?.length);
 
 
@@ -279,17 +284,9 @@ class ChatEngine {
     try {
       let msgs = [...(initState.messages ?? [])];
 
-      // 会話履歴内で繰り返される固有名詞を代名詞に置換するヘルパー
+      // 固有名詞は代名詞に置換しない。作品名・人名の認識が崩れやすくなるため。
       const dedupeNouns = (history: string, topic: string): string => {
-        if (!topic || topic.length < 2) return history;
-        const escaped = topic.split("").map((c) =>
-          /[.*+?^${}()|[\]\\]/.test(c) ? "\\" + c : c
-        ).join("");
-        let count = 0;
-        return history.replace(new RegExp(escaped, "g"), () => {
-          count++;
-          return count <= 1 ? topic : "彼";
-        });
+        return history;
       };
 
       // streaming中や空テキストを除いた確定済みメッセージのみを返すヘルパー
@@ -317,9 +314,11 @@ class ChatEngine {
         // あなたAI用のhistoryは確定済みメッセージのみ
         const youHistory = dedupeNouns(confirmedHistory(msgs), topicText);
 
-        const topicInstruction = t === 0
-          ? "\n【話題のきっかけ】" + topicText
-          : "";
+        const topicInstruction =
+          "\n【話題のきっかけ】" + topicText +
+          topicContext +
+          buildDepthPrompt(baseTurnCount + t) +
+          "\nこの話題の種別・概要から外れない。ジャンルや作品情報を想像で足さない。";
         const youPrompt =
           youCharaDef +
           CHAT_STYLE_RULE +
@@ -354,10 +353,11 @@ class ChatEngine {
         // 相手AI用のhistoryはyou確定後に再取得
         const otherHistory = dedupeNouns(confirmedHistory(msgs), topicText);
 
-        // 相手AI：personaPromptはbuildPersonaPrompt()で合成済み（キャラ語尾+共通ルール）
+        // 相手AI：発言ごとにbuildPersonaPrompt()を呼べるようにして、返し方モードを毎回変える
+        const otherPersonaPrompt = typeof personaPrompt === "function" ? personaPrompt() : personaPrompt;
         const otherPrompt =
-          personaPrompt +
-          (t === 0 ? "\n【話題のきっかけ】" + topicText : "") +
+          otherPersonaPrompt +
+          topicInstruction +
           "\n【会話履歴】\n" + otherHistory +
           "\n相手AI:";
         console.log("=== [InlineChatEngine] otherPrompt ===", otherPrompt);
@@ -1854,26 +1854,43 @@ export default function AIScreen() {
   // ── 会話を開始 ──
   // 正規化＋具体情報取得を1回のAPI呼び出しで行う
   const prepareTopicContext = async (raw: string): Promise<{ topic: string; topicContext: string }> => {
+    const localResolution = resolveTopicLocally(raw);
+    if (localResolution) return localResolution;
+
+    const wikipediaResolution = await resolveTopicFromWikipedia(raw);
+    if (wikipediaResolution) return wikipediaResolution;
+
     const curModel = aiModelRef.current;
     const curKeys = { ...apiKeysRef.current };
     const apiKey = curKeys[curModel as keyof typeof curKeys] ?? "";
     try {
       const prompt =
-        "以下の話題について2つのことを答えてください。" +
-        "①固有名詞（人名・作品名・地名）が正しく伝わる正式表記（1行）" +
-        "②会話のネタになる具体的な情報を箇条書きで4つ（作品名・出来事・特徴など固有名詞を含めて）" +
-        "\n形式：\n正式表記: ○○\n・〜\n・〜\n・〜\n・〜" +
+        "入力語の補完だけをしてください。知らない場合は絶対に推測しないでください。" +
+        "\nルール:" +
+        "\n・人名、作品名、ブランド名、地名などの固有名詞なら、正式表記と種別だけ返す" +
+        "\n・確信がない場合は正式表記を入力語のままにする" +
+        "\n・説明、経歴、作品名、店名、エピソードは作らない" +
+        "\n・食べ物や一般名詞に決めつけない" +
+        "\n形式:\n正式表記: ○○\n種別: 人名/作品名/ブランド名/地名/不明\n注意: 一言" +
         "\n話題：" + raw;
       const result = await pseudoStream(prompt, curModel, apiKey, () => {}, { current: false } as any, 250);
-      if (!result) return { topic: raw, topicContext: "" };
+      if (!result) return buildUnknownTopicContext(raw);
       const lines = result.split("\n");
       const topicLine = lines.find((l: string) => l.startsWith("正式表記:"));
+      const kindLine = lines.find((l: string) => l.startsWith("種別:"));
+      const noteLine = lines.find((l: string) => l.startsWith("注意:"));
       const topic = topicLine ? topicLine.replace("正式表記:", "").trim() : raw;
-      const bullets = lines.filter((l: string) => l.startsWith("・")).join("\n");
-      const topicContext = bullets ? "\n【参考情報】\n" + bullets + "\n" : "";
-      return { topic, topicContext };
+      const kind = kindLine ? kindLine.replace("種別:", "").trim() : "不明";
+      const note = noteLine ? noteLine.replace("注意:", "").trim() : "";
+      const officialTopic = topic && topic.length <= 80 ? topic : raw;
+      const topicContext =
+        "\n【重要語】\n" +
+        `${raw} = ${officialTopic}（${kind || "不明"}）。${note || "ユーザーが入力した話題として扱う。"}\n` +
+        "ユーザーの入力表記を維持する。意味が少しでも曖昧なら別の語に変換せず、短く確認する。\n" +
+        "この種別を会話中ずっと維持する。知らない事実、作品名、人物名、店名、エピソードは作らない。\n";
+      return { topic: raw, topicContext };
     } catch {
-      return { topic: raw, topicContext: "" };
+      return buildUnknownTopicContext(raw);
     }
   };
 
@@ -1896,8 +1913,7 @@ export default function AIScreen() {
     const topicMsg: ChatMessage = { role: "topic", text: topic };
     setChatMessages([topicMsg]);
 
-    const persona = AI_PERSONAS.find((p) => p.id === chatPersona) ?? AI_PERSONAS[0];
-    const personaPr = buildPersonaPrompt(chatPersonaRef.current);
+    const personaPr = () => buildPersonaPrompt(chatPersonaRef.current);
     const curModel = aiModelRef.current;
     const curKeys = { ...apiKeysRef.current };
 
@@ -1972,7 +1988,7 @@ export default function AIScreen() {
     setChatPaused(false);
     setChatLoading(true);
 
-    const personaPr = buildPersonaPrompt(chatPersonaRef.current);
+    const personaPr = () => buildPersonaPrompt(chatPersonaRef.current);
     const curModel = aiModelRef.current;
     const curKeys = { ...apiKeysRef.current };
 

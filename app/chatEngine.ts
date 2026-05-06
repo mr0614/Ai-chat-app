@@ -2,7 +2,7 @@
 // _layout.tsxでインスタンス化し、ai.tsxはAsyncStorageで状態を参照する
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { CHAT_STYLE_RULE, buildYouCharaDef } from "../lib/prompts";
+import { CHAT_STYLE_RULE, buildDepthPrompt, buildYouCharaDef } from "../lib/prompts";
 
 export const CHAT_STATE_KEY = "chat_engine_state";
 export const CHAT_PARTIAL_KEY = "chat_engine_partial";
@@ -17,6 +17,7 @@ export interface ChatEngineState {
   messages: EngineMessage[];
   topic: string;
   topicContext: string;
+  directorPrompt: string;
   started: boolean;
   paused: boolean;
   loading: boolean;
@@ -32,6 +33,7 @@ const defaultState = (): ChatEngineState => ({
   messages: [],
   topic: "",
   topicContext: "",
+  directorPrompt: "",
   started: false,
   paused: false,
   loading: false,
@@ -104,7 +106,7 @@ class ChatEngine {
   async runTurns(
     model: string,
     apiKeys: Record<string, string>,
-    personaPrompt: string,
+    personaPrompt: string | (() => string),
     turns: number,
     onMessage: (msg: EngineMessage) => void,
     userContext: string = "",
@@ -282,17 +284,9 @@ class ChatEngine {
       let currentState = await this.getState();
       let msgs = [...(currentState.messages ?? [])];
 
-      // streaming中や空テキストを除いた確定済みメッセージのみを返すヘルパー
+      // 固有名詞は代名詞に置換しない。人名・作品名の認識が崩れやすくなるため。
       const dedupeNouns = (history: string, topic: string): string => {
-        if (!topic || topic.length < 2) return history;
-        const escaped = topic.split("").map((c) =>
-          /[.*+?^${}()|[\]\\]/.test(c) ? "\\" + c : c
-        ).join("");
-        let count = 0;
-        return history.replace(new RegExp(escaped, "g"), () => {
-          count++;
-          return count <= 1 ? topic : "彼";
-        });
+        return history;
       };
 
       const confirmedHistory = (ms: EngineMessage[], n = 4) => {
@@ -320,9 +314,10 @@ class ChatEngine {
           "";
 
         const topicContext = currentState.topicContext ?? "";
-        const topicInstruction = t === 0
-          ? "\n【話題のきっかけ】" + topicText + topicContext
-          : "";
+        const directorPrompt = currentState.directorPrompt || userContext;
+        const depthPrompt = buildDepthPrompt((currentState.turnCount ?? 0) + t);
+        const topicInstruction =
+          "\n【この会話の主題】" + topicText + topicContext + depthPrompt + directorPrompt;
 
         // 履歴を交互発言形式で構築（重複なし）
         const historyLines = dedupeNouns(confirmedHistory(msgs), topicText);
@@ -346,7 +341,7 @@ class ChatEngine {
           if (this.aborted) break;
           youStreamed += ch;
           onMessage({ role: "you", text: youStreamed, streaming: true });
-          await new Promise((r) => setTimeout(r, 30));
+          await new Promise((r) => setTimeout(r, 65));
         }
         const youMsg: EngineMessage = { role: "you", text: youText };
         msgs = [...msgs.slice(0, -1), youMsg];
@@ -357,8 +352,9 @@ class ChatEngine {
         // 相手AI：you確定後に履歴を再構築、次は相手AIの番と明示
         const otherHistoryLines = dedupeNouns(confirmedHistory(msgs), topicText);
 
+        const otherPersonaPrompt = typeof personaPrompt === "function" ? personaPrompt() : personaPrompt;
         const otherPrompt =
-          personaPrompt +
+          otherPersonaPrompt +
           topicInstruction +
           "\n【会話履歴】\n" + otherHistoryLines +
           "\n相手AI:";  // 次は相手AIの番と明示
@@ -381,7 +377,7 @@ class ChatEngine {
           if (this.aborted) break;
           otherStreamed += ch;
           onMessage({ role: "other", text: otherStreamed, streaming: true });
-          await new Promise((r) => setTimeout(r, 30));
+          await new Promise((r) => setTimeout(r, 65));
         }
         const otherMsg: EngineMessage = { role: "other", text: otherText };
         msgs = [...msgs.slice(0, -1), otherMsg];
